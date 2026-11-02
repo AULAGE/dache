@@ -88,13 +88,20 @@ def run_sim(n, seed, learn, no_chassis=False):
 
 
 # ============================================================ 真机设备
+def chassis_options(c):
+    """config.py 里底盘驱动的可调参数（chassis_test.py 也用）"""
+    return dict(stop_model=c.CHASSIS_STOP_MODEL, cmd_latency_s=c.CHASSIS_CMD_LATENCY_S,
+                pi_tau_s=c.CHASSIS_PI_TAU_S, ref_voltage_v=c.CHASSIS_REF_VOLTAGE_V,
+                cmd_ttl_s=c.CHASSIS_CMD_TTL_S, yaw_trim_deg_per_m=c.CHASSIS_YAW_TRIM_DEG_PER_M)
+
+
 def open_devices(clock):
     cam = K230(cfg.PORTS["k230"], cfg.BAUD["k230"], clock, cfg.TARGET_TIMEOUT_S, cfg.K230_ROTATE)
     lift = Lift(cfg.PORTS["lift"], cfg.BAUD["lift"], cfg.LIFT_MAX_CM)
     arm = Arm(cfg.PORTS["arm"], cfg.BAUD["arm"], clock)
     chassis = WheeltecChassis(cfg.PORTS["chassis"], cfg.BAUD["chassis"], cfg.CHASSIS_SPEED_MM_S,
                               cfg.ACK_MIN_RADIUS_MM, cfg.CHASSIS_ACKERMANN,
-                              os.path.join(LOG_DIR, "chassis_tau.json")) \
+                              os.path.join(LOG_DIR, "chassis_tau.json"), **chassis_options(cfg)) \
         if cfg.USE_CHASSIS else NullChassis()
     return cam, lift, arm, chassis
 
@@ -187,6 +194,9 @@ def preflight(cam, lift, arm, chassis):
         if fb:
             v = chassis.voltage_mv / 1000
             item(v >= cfg.BATTERY_MIN_V, f"底盘电池 {v:.2f}V（下限 {cfg.BATTERY_MIN_V}V）", "充电")
+            # 只提示不拦截：flag 含义来自仓库里的固件源码（Flag_Stop），真机固件版本可能不同，未验证
+            if getattr(chassis, "fb_flag", 0):
+                print(f"  ⚠ 底盘回传 flag={chassis.fb_flag}（源码里 1 = 电机失能，开机 10 秒内是这样），车可能不动")
     print("  ℹ 机械臂控制板不回传状态，无法自检；第一次运行建议加 --step")
     return problems
 

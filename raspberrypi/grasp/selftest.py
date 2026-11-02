@@ -246,6 +246,218 @@ def test_chassis(tau_true=0.45):
         check("阿克曼不能原地转（报错）", True)
 
 
+# ------------------------------------------------------------ 底盘：按固件源码复现的假控制器
+class FwChassisModel:
+    """
+    按 底盘代码/大车底盘 源码（阿克曼模式）逐步复现的假底盘控制器，100Hz 一拍：
+      串口收帧 usartx.c:645-705 → XYZ_Target_Speed_transition usartx.c:829-840
+      → Vz_to_Akm_Angle usartx.c:784-820 → Drive_Motor 阿克曼分支 balance.c:70-107（阿克曼不做平滑，balance.c:24）
+      → Incremental_PI balance.c:378-397（KP=KI=700 system.c:49，限幅 ±16800）→ 回传 usartx.c:40-148（20Hz）
+      固件没有串口超时：Move_X 一直保持到下一帧。
+    电机（固件之外，假设的）：一阶惯性 + 库仑摩擦，稳态速度 = KV × 电压/参考电压 × (PWM − 摩擦)。
+      KV 取得让 τ_PI = 0.01/(KI·KV) = 0.45s，对上真机"100mm/s 松油门滑约 45mm"。
+    """
+    DT = 0.01
+    KP = KI = 700.0
+    W, L = 0.162, 0.144          # 轮距、轴距（m），robot_select_init.h:37/45（Mini 车的值，假控制器够用）
+    MIN_R = 0.350                # robot_select_init.h:31
+    KV = 0.01 / (700.0 * 0.45)
+    V_REF = 25.8
+    FRICTION = 500.0
+    TM = 0.06
+
+    def __init__(self, voltage=25.8, steer_offset_rad=0.0):
+        self.voltage = voltage
+        self.steer_offset = steer_offset_rad
+        self.move_x = self.move_z = 0.0
+        self.va = self.vb = 0.0                 # 左后轮 A、右后轮 B 实际速度 m/s
+        self.pwm = [0.0, 0.0]
+        self.last_bias = [0.0, 0.0]
+        self.yaw_rate = 0.0
+        self.flag_stop = 0
+        self.rxbuf = bytearray()
+
+    @staticmethod
+    def xyz(h, l):
+        t = (h << 8) + l
+        if t >= 0x8000:
+            t -= 0x10000
+        q = int(t / 1000)                       # C 的整数除法向 0 截断
+        return q + (t - q * 1000) * 0.001
+
+    def vz_to_akm_angle(self, vx, vz):
+        if vz != 0 and vx != 0:
+            if abs(vx / vz) <= self.MIN_R:
+                vz = abs(vx) / self.MIN_R if vz > 0 else -abs(vx) / self.MIN_R
+            return math.atan(self.L / (vx / vz + 0.5 * self.W))
+        return 0.0
+
+    def feed(self, data):
+        for byte in data:
+            if byte == 0x7B or self.rxbuf:
+                self.rxbuf.append(byte)
+            if len(self.rxbuf) == 11:
+                b = bytes(self.rxbuf)
+                self.rxbuf.clear()
+                x = 0
+                for v in b[:9]:
+                    x ^= v
+                if b[10] == 0x7D and x == b[9]:
+                    self.move_x = self.xyz(b[3], b[4])
+                    self.move_z = self.vz_to_akm_angle(self.move_x, self.xyz(b[7], b[8]))
+
+    def _pi(self, i, enc, target):
+        bias = target - enc
+        self.pwm[i] += self.KP * (bias - self.last_bias[i]) + self.KI * bias
+        self.pwm[i] = max(-16800.0, min(16800.0, self.pwm[i]))
+        self.last_bias[i] = bias
+        return self.pwm[i]
+
+    def _plant(self, v, pwm):
+        eff = 0.0 if abs(pwm) <= self.FRICTION else pwm - math.copysign(self.FRICTION, pwm)
+        return v + (self.KV * self.voltage / self.V_REF * eff - v) * self.DT / self.TM
+
+    def tick(self):
+        vx, ang = self.move_x, self.move_z
+        r = self.L / math.tan(ang) - 0.5 * self.W if ang != 0 else 0.0
+        ang = max(-0.49, min(0.32, ang))
+        ta, tb = (vx * (r - 0.5 * self.W) / r, vx * (r + 0.5 * self.W) / r) if ang != 0 else (vx, vx)
+        pa = self._pi(0, self.va, max(-3.5, min(3.5, ta)))
+        pb = self._pi(1, self.vb, max(-3.5, min(3.5, tb)))
+        self.va, self.vb = self._plant(self.va, pa), self._plant(self.vb, pb)
+        actual = ang + self.steer_offset        # 转向没回正 = 实际转角多一个偏置（编码器看不出来，陀螺仪看得出）
+        self.yaw_rate = (self.va + self.vb) / 2 * math.tan(actual) / self.L if actual else 0.0
+
+    def feedback(self):
+        def s16(x):
+            return int(x) & 0xFFFF
+        vx = s16((self.va + self.vb) / 2 * 1000)
+        wz = s16((self.vb - self.va) / self.W * 1000)
+        gz = s16(math.degrees(self.yaw_rate) * 65.5)
+        mv = int(self.voltage * 1000)
+        f = bytearray([0x7B, self.flag_stop, vx >> 8, vx & 0xFF, 0, 0, wz >> 8, wz & 0xFF]
+                      + [0] * 10 + [gz >> 8, gz & 0xFF, (mv >> 8) & 0xFF, mv & 0xFF])
+        b = 0
+        for x in f:
+            b ^= x
+        return bytes(f + bytes([b, 0x7D]))
+
+
+class FwSerial:
+    """把 FwChassisModel 包成假串口：按墙上时钟推进 100Hz 控制，每 50ms 回一帧"""
+    model = None
+
+    def __init__(self, *a, **k):
+        self.m = FwSerial.model
+        self.lock = threading.Lock()
+        self.t = time.monotonic()
+        self.writes = []
+
+    def write(self, b):
+        with self.lock:
+            self.writes.append(bytes(b))
+            self.m.feed(b)
+
+    def flush(self):
+        pass
+
+    def read(self, n):
+        time.sleep(0.05)
+        with self.lock:
+            k = int((time.monotonic() - self.t) / self.m.DT)
+            for _ in range(min(k, 50)):
+                self.m.tick()
+            self.t += k * self.m.DT
+            return self.m.feedback()
+
+    def close(self):
+        pass
+
+
+def test_chassis_fw():
+    print("底盘（假控制器按固件源码复现：阿克曼不平滑 + 增量 PI + 无串口超时）")
+    M = FwChassisModel
+
+    def coast(v0, volt=25.8):
+        m = M(voltage=volt)
+        m.move_x = v0
+        for _ in range(400):
+            m.tick()
+        vs, d = (m.va + m.vb) / 2, 0.0
+        m.move_x = 0.0
+        for _ in range(300):
+            m.tick()
+            d += (m.va + m.vb) / 2 * m.DT
+        return d / vs
+    taus = [coast(v) for v in (0.05, 0.10, 0.15)]
+    check("PI 积分恒等式：滑行/速度 和速度无关（τ 模型形式正确）", max(taus) - min(taus) < 0.02,
+          " ".join(f"{t:.3f}s" for t in taus))
+    t_low = coast(0.10, 22.5)
+    check("τ_PI 和电压成反比", abs(t_low / taus[1] - 25.8 / 22.5) < 0.05, f"22.5V: {t_low:.3f}s")
+    m = M()
+    m.feed(devices.WheeltecChassis.frame(-100, 0))
+    check("驱动下发帧被固件解析（−100mm/s）", abs(m.move_x + 0.1) < 1e-9, f"{m.move_x}")
+    m.feed(devices.WheeltecChassis.frame(0, 300))
+    check("vx=0 时固件把转角置 0（阿克曼不能原地转）", m.move_z == 0.0)
+    m.feed(devices.WheeltecChassis.frame(100, 1000))
+    check("转弯半径小于固件最小半径会被截到 350mm", abs(m.move_z - math.atan(0.144 / (0.35 + 0.081))) < 1e-6)
+
+    install_fake(FwSerial)
+
+    def runs(mode, seq, volt=25.8, **kw):
+        FwSerial.model = M(voltage=volt)
+        c = devices.WheeltecChassis("x", 115200, speed_mm_s=100, stop_model=mode, **kw)
+        errs = [abs(c.drive(mm)[0]) - abs(mm) for mm in seq]
+        return c, errs
+
+    c, errs = runs("tau", (100, 100, -100))
+    check("原做法（tau）在固件假控制器上 2 次后误差 ≤ 8mm", all(abs(e) <= 8 for e in errs[1:]),
+          " ".join(f"{e:+.1f}" for e in errs))
+    learned = (c.coast_tau, c.pi_tau)
+    c.close()
+    c, errs = runs("model", (100, 100, -100))
+    # 第 1 次偏短：RAMP_K 在终点前已经在减速，PI 积分低于稳态，实际滑得比 τ·v 少；学 1 次就对上
+    check("模型预测（model）2 次后误差 ≤ 8mm", all(abs(e) <= 8 for e in errs[1:]), " ".join(f"{e:+.1f}" for e in errs))
+    c.close()
+    FwSerial.model = M(voltage=22.5)
+    ct = devices.WheeltecChassis("x", 115200, stop_model="tau")
+    ct.coast_tau = learned[0]
+    et = abs(ct.drive(100)[0]) - 100
+    ct.close()
+    FwSerial.model = M(voltage=22.5)
+    cm = devices.WheeltecChassis("x", 115200, stop_model="model")
+    cm.pi_tau = learned[1]
+    em = abs(cm.drive(100)[0]) - 100
+    cm.close()
+    check("电池掉到 22.5V：model 按电压修正，误差 ≤ 6mm", abs(em) <= 6, f"model {em:+.1f}mm / tau {et:+.1f}mm")
+
+    FwSerial.model = M()
+    c = devices.WheeltecChassis("x", 115200, speed_mm_s=100, min_radius_mm=600)
+    _, d1 = c.drive(200, 10.0)
+    _, d2 = c.drive(-200, 10.0)
+    check("边走边转：前进/倒车都右转约 10°（wz 符号和固件一致）", abs(d1 - 10) < 2 and abs(d2 - 10) < 2,
+          f"{d1:+.1f}° {d2:+.1f}°")
+    c._set(100, 0)                       # 模拟调用方卡死：只设了一次速度就不管了
+    time.sleep(0.8)
+    check("指令过期自动停车（固件没有超时，驱动兜底）", c.ttl_tripped >= 1 and FwSerial.model.move_x == 0.0)
+    c.close()
+    check("close() 最后写的是停车帧", c.ser.writes[-1] == devices.WheeltecChassis.frame(0, 0))
+
+    FwSerial.model = M(steer_offset_rad=math.radians(-1.5))   # 转向没回正，直走往右偏
+    c = devices.WheeltecChassis("x", 115200)
+    c.drive(200)
+    drift = c.last_release["dyaw_gyro_deg"]
+    trim = drift / (abs(c.last_release["moved"]) / 1000.0)
+    c.yaw_trim = math.radians(trim) / 1000.0
+    c.drive(200)
+    f1 = c.last_release["dyaw_gyro_deg"]
+    c.drive(-200)
+    b1 = c.last_release["dyaw_gyro_deg"]
+    c.close()
+    check("航向补偿 yaw_trim：直走偏航（陀螺仪）明显减小，倒车也不反向", abs(f1) < 0.35 * abs(drift) and abs(b1) < 0.35 * abs(drift),
+          f"补偿前 {drift:+.2f}° → 前进 {f1:+.2f}° / 倒车 {b1:+.2f}°（trim={trim:+.2f}°/m）")
+
+
 # ------------------------------------------------------------ calib.json 覆盖
 def test_calib_override():
     print("calib.json 覆盖 config")
@@ -357,7 +569,7 @@ def test_sim():
 if __name__ == "__main__":
     quick = len(sys.argv) > 1 and sys.argv[1] == "quick"
     real_serial = devices.serial
-    for t in (test_arm, test_k230, test_lift, test_chassis, test_calib_override, test_step_and_guard,
+    for t in (test_arm, test_k230, test_lift, test_chassis, test_chassis_fw, test_calib_override, test_step_and_guard,
               test_geometry):
         try:
             t()

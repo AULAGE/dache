@@ -73,7 +73,8 @@ K230 ──串口──►                ┌──► 升降轴 STM32（伺服�
 | `grasp/calib.json` | **标定结果**（`calib.py` 自动写，覆盖 config.py 里的默认值；删掉就恢复默认） |
 | `grasp/calib.py` | 标定工具：watch / goal / jog / auto / teach …… |
 | `grasp/main.py` | 入口：`--check` 自检、`--sim` 仿真、真机运行（`--step` 单步、`--no-chassis`） |
-| `grasp/selftest.py` | 离线自测：假下位机测所有驱动 + 几何前馈 + 仿真回归（36 项）。改完代码先跑它 |
+| `grasp/selftest.py` | 离线自测：假下位机测所有驱动（底盘按固件源码复现）+ 几何前馈 + 仿真回归（48 项）。改完代码先跑它 |
+| `grasp/chassis_test.py` | 底盘停车精度真机测试：走 ±100mm 各 3 次打印误差、航向漂移（`--model`、`--ruler`、`--timeout-check`），见 `docs/cloud_tasks/results/03_报告.md` |
 | `grasp/report.py` | 看日志：成功率、步数趋势、某次抓取的逐步误差/动作，并给出诊断提示 |
 | `grasp/task.py` | 任务流程：搜索 → 对准 → 抓取 → 确认 → 放置 |
 | `grasp/servo.py` | 自适应视觉伺服 |
