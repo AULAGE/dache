@@ -1,6 +1,7 @@
 """
 各下位机驱动。真机和仿真（sim.py）实现同一套接口，任务逻辑不用区分。
 """
+import atexit
 import json
 import math
 import os
@@ -254,39 +255,69 @@ class WheeltecChassis:
     """
     WHEELTEC 底盘控制器（/dev/ttyACM0，115200），和 pad_drive3.py / ack_forward_cm.py 同一个协议：
       下发 11 字节：7B 00 00 | vx(int16, mm/s) | vy(int16) | wz(int16, 0.001rad/s，左转为正) | BCC | 7D
-            控制器需要持续收到帧（这里 50Hz），停发会自动刹车
       回传 24 字节：7B flag | vx vy wz | 加速度x3 | 角速度x3 | 电压(mV) | BCC | 7D （约 20Hz）
     用回传的实际速度积分里程，走多远按里程判断，不按时间猜。
 
     ackermann=True：阿克曼转向，不能原地转；转向只能边走边转（drive 的 dpsi_deg）
+
+    固件分析结论（底盘代码/大车底盘，详见 docs/cloud_tasks/results/03_报告.md；仓库里的源码和真机
+    刷的固件版本可能不同，以下都"未在真机验证"）：
+      - 固件【没有】串口超时停车：最后一帧的速度会一直保持（usartx.c:645-705 只在收到帧时改 Move_X）。
+        所以这里 50Hz 持续发送 + 指令过期（cmd_ttl_s）自动发 0 + 退出时直接写停车帧。
+      - 阿克曼车型【不做】速度平滑（balance.c:24 只对麦轮/全向轮调用 Smooth_control），
+        松油门后的滑行来自增量式 PI（balance.c:378-397，KP=KI=700，100Hz）：
+        积分恒等式给出 滑行距离 ≈ v × τ_PI，τ_PI 和速度无关、和电池电压成反比。
+      - 回传 flag 字节 = Flag_Stop（usartx.c:109），1 = 电机失能（开机前 10 秒都是 1）。
+      - 回传角速度 Z = ICM20948 原始值，量程 ±500°/s → 65.5 LSB/(°/s)（ICM20948.c:85）。
     """
     TX_HZ = 50
 
-    def __init__(self, port, baud, speed_mm_s=100, min_radius_mm=600, ackermann=True, tau_file=None):
+    def __init__(self, port, baud, speed_mm_s=100, min_radius_mm=600, ackermann=True, tau_file=None,
+                 stop_model="tau", cmd_latency_s=0.02, pi_tau_s=0.45, ref_voltage_v=25.8,
+                 cmd_ttl_s=0.5, yaw_trim_deg_per_m=0.0, gyro_lsb_per_dps=65.5):
         if serial is None:
             raise DeviceError("缺少 pyserial：pip install pyserial")
         self.ser = serial.Serial(port, baud, timeout=0.05)
         self.speed = speed_mm_s
         self.coast_tau = 0.5     # 松油门后的滑行时间常数（s）：滑行距离 ≈ τ × 速度；会自动修正
+        # 模型预测（stop_model="model"）：滑行 = v ×（指令延迟 + τ_PI × 参考电压/当前电压），
+        # 并用回传帧的"年龄"外推里程。τ_PI 同样自适应学习。"tau" = 原来的做法（默认）
+        self.stop_model = stop_model
+        self.cmd_latency = cmd_latency_s
+        self.pi_tau = pi_tau_s
+        self.ref_voltage = ref_voltage_v
         self.tau_file = tau_file  # 学到的 τ 存这里，下次启动直接用
         if tau_file:
             try:
                 with open(tau_file, encoding="utf-8") as f:
-                    self.coast_tau = float(json.load(f)["coast_tau"])
-            except (OSError, ValueError, KeyError):
+                    saved = json.load(f)
+                self.coast_tau = float(saved["coast_tau"])
+                self.pi_tau = float(saved.get("pi_tau", self.pi_tau))
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 pass
         self.min_radius = min_radius_mm
         self.ackermann = ackermann
+        self.cmd_ttl = cmd_ttl_s          # 指令多久没刷新就自动改发 0（固件自己不会超时停车）；0 = 关
+        self.yaw_trim = math.radians(yaw_trim_deg_per_m) / 1000.0   # rad/mm：直走时车头每 mm 右偏多少
+        self.gyro_lsb = gyro_lsb_per_dps
         self.cmd = (0, 0)
+        self.cmd_t = time.monotonic()
+        self.ttl_tripped = 0       # 指令过期自动停车的次数（调试用）
         self.dist = 0.0            # 里程（mm，前进为正）
-        self.yaw = 0.0             # 航向（rad，左转为正）
+        self.yaw = 0.0             # 航向（rad，左转为正），编码器差速算的（回传 wz）
+        self.yaw_gyro = 0.0        # 航向（rad，左转为正），陀螺仪 Z 积分（只做对比，未在真机验证量程）
         self.fb_vx = 0
+        self.fb_wz = 0
+        self.fb_flag = 0           # 固件 Flag_Stop：1 = 电机失能
+        self.gyro_z_raw = 0
         self.voltage_mv = 0
         self.last_fb = 0.0
+        self.last_release = None   # 最近一次松油门的记录（调试/测试脚本用）
         self._lock = threading.Lock()
         self._run = True
         threading.Thread(target=self._tx, daemon=True).start()
         threading.Thread(target=self._rx, daemon=True).start()
+        atexit.register(self._emergency_stop)
         time.sleep(0.3)            # 等第一批回传帧
 
     @staticmethod
@@ -303,6 +334,11 @@ class WheeltecChassis:
         while self._run:
             with self._lock:
                 vx, wz = self.cmd
+                if (vx or wz) and self.cmd_ttl > 0 and time.monotonic() - self.cmd_t > self.cmd_ttl:
+                    # 调用方卡住/崩了没再刷新指令：固件不会自己停，这里替它停
+                    self.cmd = (0, 0)
+                    vx = wz = 0
+                    self.ttl_tripped += 1
             try:
                 self.ser.write(self.frame(vx, wz))
             except Exception:
@@ -337,12 +373,18 @@ class WheeltecChassis:
                 now = time.monotonic()
                 vx = int.from_bytes(f[2:4], "big", signed=True)
                 wz = int.from_bytes(f[6:8], "big", signed=True)
+                gz = int.from_bytes(f[18:20], "big", signed=True)
                 with self._lock:
                     if last is not None and now - last < 0.5:
                         dt = now - last
                         self.dist += vx * dt
                         self.yaw += wz / 1000.0 * dt
+                        if self.gyro_lsb:
+                            self.yaw_gyro += math.radians(gz / self.gyro_lsb) * dt
                     self.fb_vx = vx
+                    self.fb_wz = wz
+                    self.fb_flag = f[1]
+                    self.gyro_z_raw = gz
                     self.voltage_mv = int.from_bytes(f[20:22], "big")
                     self.last_fb = now
                 last = now
@@ -350,9 +392,21 @@ class WheeltecChassis:
     def _set(self, vx, wz):
         with self._lock:
             self.cmd = (int(vx), int(wz))
+            self.cmd_t = time.monotonic()
 
     def has_feedback(self):
         return time.monotonic() - self.last_fb < 0.5
+
+    def _voltage_v(self):
+        v = self.voltage_mv / 1000.0
+        return v if 5.0 < v < 60.0 else self.ref_voltage
+
+    def predict_coast(self, v_act):
+        """模型预测：以实际速度 v_act（mm/s）松油门后还会走多远（mm）"""
+        tau = self.cmd_latency + self.pi_tau * self.ref_voltage / self._voltage_v()
+        if not (0.0 < tau < 3.0):          # 模型参数坏了：退回自适应 τ
+            tau = self.coast_tau
+        return abs(v_act) * tau
 
     MIN_SPEED = 30          # mm/s，快到终点时最低指令速度（太低控制器可能不动）
     RAMP_K = 1.5            # 1/s：剩余距离 × RAMP_K = 指令速度上限（越靠近终点越慢）
@@ -362,10 +416,12 @@ class WheeltecChassis:
         走 mm（负数后退），同时让车头右转 dpsi_deg（负数左转）。
         阿克曼底盘转角受最小转弯半径限制，会自动截断。返回实际 (走了多少 mm, 车头右转了多少度)
 
-        WHEELTEC 控制器内部有平滑减速：松油门后车还会滑 ≈ τ × 当时的实际速度。所以：
+        松油门后车还会滑一段（固件 PI 速度环要把积分量放掉）。所以：
           1. 快到终点按剩余距离降低指令速度
-          2. 剩余距离 ≤ τ × 回传的实际速度 时松油门
-          3. 停稳后用"滑了多远 / 松油门时的速度"修正 τ（自适应，越走越准）
+          2. 剩余距离 ≤ 预计滑行距离 时松油门
+             stop_model="tau"  ：预计滑行 = τ × 回传的实际速度（原做法）
+             stop_model="model"：预计滑行 = predict_coast(v)，里程按回传帧年龄外推
+          3. 停稳后用"滑了多远 / 松油门时的速度"修正 τ（两种参数都学，越走越准）
         """
         if abs(mm) < 1:
             return 0.0, 0.0
@@ -375,12 +431,13 @@ class WheeltecChassis:
         target = abs(mm)
         curv = -math.radians(dpsi_deg) / target      # 每 mm 的航向变化（rad/mm，ROS 左转为正）
         timeout = timeout or (target / self.MIN_SPEED * 1.5 + 3.0)
+        model = self.stop_model == "model"
 
         with self._lock:
-            d0, y0 = self.dist, self.yaw
+            d0, y0, g0 = self.dist, self.yaw, self.yaw_gyro
         fb = self.has_feedback()
         t0 = time.monotonic()
-        done_rel = v_rel = None
+        done_rel = v_rel = done_est_rel = None
         try:
             while True:
                 el = time.monotonic() - t0
@@ -388,18 +445,27 @@ class WheeltecChassis:
                     with self._lock:
                         done = abs(self.dist - d0)
                         v_act = abs(self.fb_vx)
-                    remaining = target - done
-                    if remaining <= self.coast_tau * v_act or remaining <= 0:
-                        done_rel, v_rel = done, v_act
+                        age = time.monotonic() - self.last_fb
+                    if model:
+                        done_est = done + v_act * min(max(age, 0.0), 0.1)   # 回传帧之后又走了这么多
+                        coast = self.predict_coast(v_act)
+                    else:
+                        done_est = done
+                        coast = self.coast_tau * v_act
+                    remaining = target - done_est
+                    if remaining <= coast or remaining <= 0:
+                        done_rel, v_rel, done_est_rel = done, v_act, done_est
                         break
                     v = max(self.MIN_SPEED, min(self.speed, remaining * self.RAMP_K))
                 else:
                     if el >= target / self.speed:            # 没有回传时按时间走
                         break
                     v = self.speed
-                self._set(sign * v, curv * v * 1000.0)       # wz 跟着速度变，保证走的是同一条弧线
+                # wz 跟着速度变，保证走的是同一条弧线；yaw_trim 抵消转向没回正（倒车时舵角要同向，所以乘 sign）
+                self._set(sign * v, (curv + sign * self.yaw_trim) * v * 1000.0)
                 if el > timeout:
-                    raise DeviceError("底盘移动超时（被卡住？）")
+                    flag = f"，回传 flag={self.fb_flag}（1 = 固件电机失能：开机不到 10 秒？）" if self.fb_flag else ""
+                    raise DeviceError("底盘移动超时（被卡住？）" + flag)
                 time.sleep(0.02)
         finally:
             self._set(0, 0)
@@ -409,16 +475,22 @@ class WheeltecChassis:
         if not fb:
             return float(mm), dpsi_deg
         with self._lock:
-            moved, dyaw = self.dist - d0, self.yaw - y0
+            moved, dyaw, dgyro = self.dist - d0, self.yaw - y0, self.yaw_gyro - g0
+        self.last_release = {"done": done_rel, "done_est": done_est_rel, "v": v_rel, "moved": moved,
+                             "dyaw_gyro_deg": -math.degrees(dgyro), "voltage_v": self._voltage_v()}
         if v_rel and v_rel > 20:
             tau_meas = (abs(moved) - done_rel) / v_rel
             tau_meas = max(0.05, min(1.5, tau_meas))
             self.coast_tau += 0.6 * (tau_meas - self.coast_tau)
+            # 模型参数：扣掉指令延迟，再换算到参考电压
+            pi_meas = ((abs(moved) - done_est_rel) / v_rel - self.cmd_latency) * self._voltage_v() / self.ref_voltage
+            pi_meas = max(0.02, min(1.5, pi_meas))
+            self.pi_tau += 0.6 * (pi_meas - self.pi_tau)
             if self.tau_file:
                 try:
                     os.makedirs(os.path.dirname(self.tau_file) or ".", exist_ok=True)
                     with open(self.tau_file, "w", encoding="utf-8") as f:
-                        json.dump({"coast_tau": self.coast_tau}, f)
+                        json.dump({"coast_tau": self.coast_tau, "pi_tau": self.pi_tau}, f)
                 except OSError:
                     pass
         return moved, -math.degrees(dyaw)
@@ -432,9 +504,24 @@ class WheeltecChassis:
     def stop(self):
         self._set(0, 0)
 
+    def _write_stop_frames(self, n=3):
+        """不经过发送线程，直接往串口写停车帧（退出时线程可能已经不在了）"""
+        for _ in range(n):
+            try:
+                self.ser.write(self.frame(0, 0))
+                self.ser.flush()
+            except Exception:
+                return
+
+    def _emergency_stop(self):
+        if self._run:
+            self._set(0, 0)
+            self._write_stop_frames()
+
     def close(self):
         self._set(0, 0)
         time.sleep(0.1)
+        self._write_stop_frames()
         self._run = False
 
 

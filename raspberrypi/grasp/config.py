@@ -29,12 +29,24 @@ BAUD = {"k230": 115200, "lift": 115200, "arm": 9600, "chassis": 115200}
 USE_CHASSIS = True    # 没有底盘（固定工位）就改成 False：深度不再闭环，只靠机械臂伸出姿态插值
 CHASSIS_ACKERMANN = True   # 阿克曼转向（不能原地转，只能边走边转）
 ACK_MIN_RADIUS_MM = 600.0  # [标定] 最小转弯半径；打满方向盘走一圈量一下
+#   仓库里的底盘源码（Mini 阿克曼）是 350mm（底盘代码/大车底盘/BALANCE/robot_select_init.h:31），
+#   但那份源码和真机刷的固件对不上（电压被限在 12.6V，真机回传 25.8V），所以这里不改，仍需实测。
+#   固件会把 |vx/wz| 小于它的最小半径的指令截到最小半径（usartx.c:801-808）；600 > 350，不会被截。
 CHASSIS_SPEED_MM_S = 100   # 对准时底盘速度（mm/s），慢一点停得准
 MANUAL_PROCESS = "pad_drive3.py"   # 这个程序在运行 = 手柄接管，自动抓取暂停并让出串口
+
+# —— 底盘驱动细节（固件分析见 docs/cloud_tasks/results/03_报告.md；默认值都保持原行为）——
+CHASSIS_STOP_MODEL = "tau"        # 松油门时机："tau" = 原来的自适应 τ；"model" = 按固件 PI 速度环推导的模型（未在真机验证）
+CHASSIS_CMD_LATENCY_S = 0.02      # model：指令延迟（50Hz 发送平均 10ms + 固件 100Hz 控制周期平均 5ms + USB）
+CHASSIS_PI_TAU_S = 0.45           # model：PI 速度环把积分放掉的时间常数（参考电压下），会自动学习；初值按实测"100mm/s 滑约 45mm"
+CHASSIS_REF_VOLTAGE_V = 25.8      # model：上面 τ 对应的电池电压（电机速度 ∝ 电压，所以 τ_PI ∝ 1/电压）
+CHASSIS_CMD_TTL_S = 0.5           # 指令超过这么久没刷新就自动改发 0（固件没有串口超时，见 usartx.c:645-705）；0 = 关
+CHASSIS_YAW_TRIM_DEG_PER_M = 0.0  # [标定] 直走时车头每米自己右偏多少度（chassis_test.py 会打印），驱动反向补偿；0 = 不补
 
 # ======================= 安全 =======================
 LIFT_MAX_CM = 44.0         # 升降轴软件上限（旧脚本 ourcar.py / pad_drive3.py 都用 44；固件硬上限 50）
 BATTERY_MIN_V = 22.0       # 底盘电池低于这个电压不启动（实测满电约 25.8V）
+#   固件源码自己的低压保护是 10V（12V 小车用，balance.c:328），对 24V 车不起作用，所以这一项必须由树莓派把关
 
 # K230 相机安装方向：画面坐标转回"x 右、y 下"。
 # K230 板子上的程序（sdcard/main.py，副本在 D:\大车\k230_sdcard\）已经设了 ROTATE_DEG = 90、
@@ -159,6 +171,8 @@ CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "REACH_NEAR_D", "REACH_FAR_D", "POSES_CALIBRATED", "ACK_MIN_RADIUS_MM", "K230_ROTATE", "LIFT_MAX_CM",
     "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
     "ARM_SLOW_MS", "STEP_ALPHA",
+    "CHASSIS_STOP_MODEL", "CHASSIS_CMD_LATENCY_S", "CHASSIS_PI_TAU_S", "CHASSIS_REF_VOLTAGE_V",
+    "CHASSIS_CMD_TTL_S", "CHASSIS_YAW_TRIM_DEG_PER_M",
 }
 
 
