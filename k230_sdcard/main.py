@@ -112,6 +112,22 @@ SEND_LOST_FRAME = False
 SEND_HEARTBEAT = True
 HEARTBEAT_MS = 200
 
+# ============================ 审查修复 / 提速开关（云端任务 04） ============================
+# 说明见 docs/cloud_tasks/results/04_报告.md。每项都能单独开关，方便在板子上逐项对比。
+# --- bug 修复：默认 False = 保持原来的行为；真机确认后再逐项打开 ---
+FIX_OBB_ANGLE_WRAP = False  # 旋转框角度跨过 0°/90° 边界时宽高互换（原来只取模不互换，长方形目标会被转 90°，测深可差 30%）
+FIX_STALE_OBB = False       # 某帧没拟合出旋转框时，沿用的旧旋转框跟着正框平移/缩放（原来原地不动，最多发 3 帧旧位置）
+OBB_HOLD_FRAMES = 3         # 连续几帧拟合不到旋转框后退回正框（原来写死 3）
+FIX_DEPTH_NONZERO = False   # 算出的深度 < 1mm 时不发位置帧（原来会被截成 D=0，树莓派当成心跳）
+# --- 提速：结果完全不变的默认打开；会改变结果的默认保持原值 ---
+FAST_OBB_POINTS = True      # fit_obb 先用布尔下标挑出掩膜内的点再搜角度（结果不变；ulab 不支持布尔下标时自动退回原算法）
+CACHE_CENTER_COLOR = True   # 同一帧里同一个框的 center_color 只算一次（select 颜色门限和颜色精修共用，结果不变）
+OSD_EVERY = 1               # 每几帧画一次 OSD（1 = 每帧画，原行为）。车上没人看屏幕时可设 3~5，只影响显示，不影响串口
+PRINT_OBJECT = True         # 每次发位置帧时在终端打印 "Object: ..."（False 省一点时间，不影响串口）
+GC_MIN_FREE_KB = 0          # >0 时改为"空闲内存低于该值才 gc"（替代 GC_EVERY），0 = 原行为
+REFINE_GRID_CEIL = False    # 颜色精修降采样步长向上取整，保证网格不超过 REFINE_GRID（原来向下取整，小目标网格可达 95x95）
+PROFILE_DETAIL = False      # Profiler 额外统计颜色精修内部各步（center_color / mask / fit_obb / subpixel）耗时
+
 # ============================ 显示 ============================
 display_mode = "hdmi"
 
@@ -280,6 +296,22 @@ def wrap_angle_diff(d):
     half = ANGLE_PERIOD / 2.0
     return ((d + half) % ANGLE_PERIOD) - half
 
+def norm_obb_angle(w, h, a):
+    """
+    把旋转框角度归一到 [0, ANGLE_PERIOD)，同时保持是"同一个矩形"：
+    (w, h, a) 和 (h, w, a ± 90°) 是同一个矩形，所以每跨过奇数个 90° 宽高要互换。
+    （只做 a % 90 而不互换，会把长方形转 90°；正方形 w≈h 看不出来）
+    """
+    k = math.floor(a / ANGLE_PERIOD)
+    a = a - k * ANGLE_PERIOD
+    swap = int(round(k * ANGLE_PERIOD / 90.0)) % 2 == 1
+    if a >= ANGLE_PERIOD:           # 浮点误差：-1e-17 这类会得到正好 ANGLE_PERIOD
+        a -= ANGLE_PERIOD
+        swap = swap != (int(round(ANGLE_PERIOD / 90.0)) % 2 == 1)
+    if swap:
+        w, h = h, w
+    return w, h, a
+
 def vo_rotation_flag():
     deg = ROTATE_DEG
     if VO_FLAG_INVERT and deg in (90, 270):
@@ -385,6 +417,39 @@ def longest_run(vals, thresh, center):
 
 _coord_cache = {}
 
+# PROFILE_DETAIL：颜色精修内部各步的累计耗时（微秒），由 Profiler.end_frame 打印后清零
+_detail = {}
+_detail_order = []
+
+def _dt_add(name, t0):
+    """把 t0（ticks_us）到现在的耗时累加到 name，返回现在的时间"""
+    now = time.ticks_us()
+    if name not in _detail:
+        _detail[name] = 0
+        _detail_order.append(name)
+    _detail[name] += time.ticks_diff(now, t0)
+    return now
+
+def _t_now():
+    return time.ticks_us() if PROFILE_DETAIL else 0
+
+# FAST_OBB_POINTS：ulab 是否支持布尔下标（第一次用时实测一次；不支持就退回原算法）
+_bool_index = None
+
+def _bool_index_ok():
+    global _bool_index
+    if _bool_index is None:
+        try:
+            a = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=NP_FLOAT)
+            r = a[a > 2.5]
+            _bool_index = (len(r) == 3 and float(r[0]) == 3.0 and float(r[2]) == 5.0)
+        except Exception as e:
+            if is_stop(e):
+                raise
+            _bool_index = False
+        print("FAST_OBB_POINTS:", "on" if _bool_index else "off (ulab 不支持布尔下标，用原算法)")
+    return _bool_index
+
 def _grid_coords(eh, ew):
     """腐蚀后网格的坐标数组（按尺寸缓存，避免每帧用 Python 循环重新生成几千个元素）"""
     key = (eh, ew)
@@ -416,11 +481,23 @@ def fit_obb(mask, step, rx0, ry0, angle_hint=None):
         return None
     # 腐蚀后格子 (i, j) 对应 2x2 块，中心位于格点坐标 (j + 1, i + 1)
     xs, ys = _grid_coords(eh, ew)
-    pen = (ef - 1.0) * 1e6       # 掩膜内 0，掩膜外 -1e6
+    px = py = None
+    if FAST_OBB_POINTS and _bool_index_ok():
+        # 只保留掩膜内的点（通常只占搜索区域的 30~50%），每个角度少做 4 次整图运算
+        sel = ef > 0.5
+        px, py = xs[sel], ys[sel]
+        if len(px) < OBB_MIN_POINTS:
+            px = py = None
+    if px is None:
+        pen = (ef - 1.0) * 1e6       # 掩膜内 0，掩膜外 -1e6
 
     def extents(a):
         r = math.radians(a)
         c, s = math.cos(r), math.sin(r)
+        if px is not None:
+            u = px * c + py * s
+            v = py * c - px * s
+            return (np.min(u), np.max(u), np.min(v), np.max(v))
         u = xs * c + ys * s
         v = ys * c - xs * s
         return (np.min(u - pen), np.max(u + pen), np.min(v - pen), np.max(v + pen))
@@ -459,7 +536,10 @@ def fit_obb(mask, step, rx0, ry0, angle_hint=None):
     cx = rx0 + (uc * c - vc * s) * step
     cy = ry0 + (uc * s + vc * c) * step
     w, h = du * step, dv * step
-    ang = best_a % ANGLE_PERIOD
+    if FIX_OBB_ANGLE_WRAP:
+        w, h, ang = norm_obb_angle(w, h, best_a)
+    else:
+        ang = best_a % ANGLE_PERIOD
     return [cx, cy, w, h, ang]
 
 def _pix_rgb(np_img, x, y, fw, fh):
@@ -558,7 +638,10 @@ def subpixel_refine(np_img, obb, color, fw, fh, step, bg):
     if ENABLE_ANGLE_REFINE and len(deltas) >= 2 and min(w, h) >= ANGLE_REFINE_MIN_SIDE:
         d = median(deltas)
         if abs(math.degrees(d)) <= ANGLE_REFINE_MAX_DEG:
-            a = (a + math.degrees(d)) % ANGLE_PERIOD
+            if FIX_OBB_ANGLE_WRAP:
+                a = a + math.degrees(d)          # 最后和宽高一起归一化
+            else:
+                a = (a + math.degrees(d)) % ANGLE_PERIOD
     ou_p, ou_m, ov_p, ov_m = offs
     du = (ou_p - ou_m) / 2.0
     dv = (ov_p - ov_m) / 2.0
@@ -568,9 +651,22 @@ def subpixel_refine(np_img, obb, color, fw, fh, step, bg):
     nh = h + ov_p + ov_m
     if nw < MIN_BOX_PIX or nh < MIN_BOX_PIX:
         return obb, 0
+    if FIX_OBB_ANGLE_WRAP:
+        nw, nh, a = norm_obb_angle(nw, nh, a)
     return [ncx, ncy, nw, nh, a], good
 
-def color_refine(np_img, box, fw, fh, angle_hint=None, fast=False):
+def center_color_cached(np_img, box, fw, fh, cache):
+    """CACHE_CENTER_COLOR：同一帧里同一个框只算一次 center_color（cache 为每帧新建的 dict）"""
+    if cache is None or not CACHE_CENTER_COLOR:
+        return center_color(np_img, box, fw, fh)
+    key = (box[0], box[1], box[2], box[3])
+    c = cache.get(key)
+    if c is None:
+        c = center_color(np_img, box, fw, fh)
+        cache[key] = c
+    return c
+
+def color_refine(np_img, box, fw, fh, angle_hint=None, fast=False, cache=None):
     """
     用物块颜色在检测框附近重新找边缘。
     返回 (refined_box, color, obb)：
@@ -580,7 +676,10 @@ def color_refine(np_img, box, fw, fh, angle_hint=None, fast=False):
     w, h = x2 - x1, y2 - y1
     if w < 12 or h < 12:
         return None, None, None
-    color = center_color(np_img, box, fw, fh)
+    t0 = _t_now()
+    color = center_color_cached(np_img, box, fw, fh, cache)
+    if PROFILE_DETAIL:
+        _dt_add("r.color", t0)
     chroma = max(color) - min(color)
     if not ENABLE_COLOR_REFINE or chroma < REFINE_MIN_CHROMA:
         return None, color, None
@@ -600,7 +699,11 @@ def _refine_once(np_img, box, color, chroma, expand, fw, fh, angle_hint=None, fa
     ry0 = int(clamp(y1 - h * expand, 0, fh - 2))
     rx1 = int(clamp(x2 + w * expand, rx0 + 2, fw))
     ry1 = int(clamp(y2 + h * expand, ry0 + 2, fh))
-    step = max(1, max(rx1 - rx0, ry1 - ry0) // REFINE_GRID)
+    if REFINE_GRID_CEIL:
+        step = max(1, (max(rx1 - rx0, ry1 - ry0) + REFINE_GRID - 1) // REFINE_GRID)
+    else:
+        step = max(1, max(rx1 - rx0, ry1 - ry0) // REFINE_GRID)
+    t0 = _t_now()
     patch = np.array(np_img[:, ry0:ry1:step, rx0:rx1:step], dtype=NP_FLOAT)
 
     # 自适应容差：既看物块颜色鲜艳度，也看与背景的颜色差（背景接近物块颜色时收紧）
@@ -611,12 +714,18 @@ def _refine_once(np_img, box, color, chroma, expand, fw, fh, angle_hint=None, fa
     tol = clamp(min(chroma * 0.6, contrast * 0.5), 20, 90)
     dist = color_dist_map(patch, color)
     mask = np.clip((tol - dist) * 1000.0, 0.0, 1.0)     # 同色=1，异色=0
+    if PROFILE_DETAIL:
+        t0 = _dt_add("r.mask", t0)
 
     # 优先：旋转框
     if ENABLE_OBB:
         obb = fit_obb(mask, step, rx0, ry0, angle_hint)
+        if PROFILE_DETAIL:
+            t0 = _dt_add("r.obb", t0)
         if obb is not None and ENABLE_SUBPIXEL and not fast:
             obb, _ = subpixel_refine(np_img, obb, color, fw, fh, step, bg)
+            if PROFILE_DETAIL:
+                t0 = _dt_add("r.subpix", t0)
         if obb is not None and 1.0 / REFINED_ASPECT_MAX <= obb[2] / obb[3] <= REFINED_ASPECT_MAX:
             cs = obb_corners(obb)
             px = [p[0] for p in cs]
@@ -703,11 +812,18 @@ class Tracker:
         o = self.obb
         return [o[0] + self.vel[0] * k, o[1] + self.vel[1] * k, o[2], o[3], o[4]]
 
-    def _update_obb(self, obb, alpha):
+    def _update_obb(self, obb, alpha, follow=None):
+        """follow = (dx, dy, scale)：正框本帧的平移和尺寸比例，FIX_STALE_OBB 时让沿用的旧旋转框跟着走"""
         if obb is None:
             self.obb_miss += 1
-            if self.obb_miss > 3:
+            if self.obb_miss > OBB_HOLD_FRAMES:
                 self.obb = None   # 连续几帧拟合不到旋转框，退回正框
+            elif FIX_STALE_OBB and follow is not None and self.obb is not None:
+                o = self.obb
+                o[0] += follow[0]
+                o[1] += follow[1]
+                o[2] *= follow[2]
+                o[3] *= follow[2]
             return
         self.obb_miss = 0
         n = list(obb)
@@ -724,7 +840,10 @@ class Tracker:
             if abs(d) > DEADBAND_PIX:
                 o[i] += alpha * d
         if abs(d_ang) > 0.3:          # 角度死区 0.3°
-            o[4] = (o[4] + alpha * d_ang) % ANGLE_PERIOD
+            if FIX_OBB_ANGLE_WRAP:
+                o[2], o[3], o[4] = norm_obb_angle(o[2], o[3], o[4] + alpha * d_ang)
+            else:
+                o[4] = (o[4] + alpha * d_ang) % ANGLE_PERIOD
 
     def select(self, det_boxes, start_score, keep_score, color_of):
         """返回 (det, matched)。color_of(box) 返回该框中心颜色，用于颜色一致性校验"""
@@ -809,14 +928,21 @@ class Tracker:
             alpha = 1.0 - (1.0 - alpha) ** (dt_ms / REF_FRAME_MS)
         old_cx = (self.smooth[0] + self.smooth[2]) / 2
         old_cy = (self.smooth[1] + self.smooth[3]) / 2
+        old_size = size
         for i in range(4):
             d = med[i] - self.smooth[i]
             if abs(d) > DEADBAND_PIX:
                 self.smooth[i] += alpha * d
         steps = self.miss + 1
-        self.vel[0] = 0.5 * self.vel[0] + 0.5 * ((self.smooth[0] + self.smooth[2]) / 2 - old_cx) / steps
-        self.vel[1] = 0.5 * self.vel[1] + 0.5 * ((self.smooth[1] + self.smooth[3]) / 2 - old_cy) / steps
-        self._update_obb(obb, alpha)
+        new_cx = (self.smooth[0] + self.smooth[2]) / 2
+        new_cy = (self.smooth[1] + self.smooth[3]) / 2
+        self.vel[0] = 0.5 * self.vel[0] + 0.5 * (new_cx - old_cx) / steps
+        self.vel[1] = 0.5 * self.vel[1] + 0.5 * (new_cy - old_cy) / steps
+        follow = None
+        if FIX_STALE_OBB:
+            new_size = max(self.smooth[2] - self.smooth[0], self.smooth[3] - self.smooth[1], 1)
+            follow = (new_cx - old_cx, new_cy - old_cy, new_size / old_size)
+        self._update_obb(obb, alpha, follow)
 
         self.hits += 1
         self.miss = 0
@@ -951,9 +1077,30 @@ class Profiler:
             print("[timing ms/frame] " + " | ".join(parts) +
                   " | total {:.1f} ({:.1f} fps)".format(total / self.frames / 1000.0,
                                                        self.frames * 1e6 / total if total else 0))
+            if PROFILE_DETAIL and _detail_order:
+                print("[timing detail ms/frame] " + " | ".join(
+                    "{} {:.1f}".format(k, _detail[k] / self.frames / 1000.0) for k in _detail_order))
+                _detail.clear()
+                _detail_order.clear()
             self.acc = {}
             self.order = []
             self.frames = 0
+
+class _NullOSD:
+    """OSD_EVERY > 1 时不画的那几帧用它代替 osd_img：所有绘图调用都什么也不做"""
+    def clear(self):
+        pass
+
+    def draw_line(self, *a, **k):
+        pass
+
+    def draw_cross(self, *a, **k):
+        pass
+
+    def draw_string_advanced(self, *a, **k):
+        pass
+
+_NULL_OSD = _NullOSD()
 
 def pick_color(color_four, cls):
     try:
@@ -1144,8 +1291,9 @@ def detection():
                 prof.mark("post")
 
                 # ---------- 选择目标 ----------
+                cc_cache = {} if CACHE_CENTER_COLOR else None
                 if color_ok:
-                    color_of = lambda bb: center_color(np_img, bb, FW, FH)
+                    color_of = lambda bb: center_color_cached(np_img, bb, FW, FH, cc_cache)
                 else:
                     color_of = lambda bb: None
                 det, matched = tracker.select(det_boxes or [], start_score, keep_score, color_of)
@@ -1159,7 +1307,8 @@ def detection():
                             hint = tracker.obb[4] if (matched and tracker.obb is not None) else None
                             moving = matched and tracker.motion > MOTION_REF
                             nb, color, obb = color_refine(np_img, raw, FW, FH, hint,
-                                                          fast=moving and not SUBPIX_WHEN_MOVING)
+                                                          fast=moving and not SUBPIX_WHEN_MOVING,
+                                                          cache=cc_cache)
                             if nb is not None:
                                 box, refined = nb, True
                             color_fail = 0
@@ -1179,7 +1328,9 @@ def detection():
                             send_position_via_uart(0, 0, 0)
                 prof.mark("refine")
 
-                osd_img.clear()
+                draw_osd = OSD_EVERY <= 1 or frame_no % OSD_EVERY == 0
+                osd = osd_img if draw_osd else _NULL_OSD
+                osd.clear()
 
                 if tracker.confirmed():
                     holding = tracker.miss > 0
@@ -1202,31 +1353,31 @@ def detection():
                         color = (128, 128, 128) if holding else pick_color(color_four, tracker.cls)
                         for k in range(4):
                             p, q = poly[k], poly[(k + 1) % 4]
-                            osd_img.draw_line(p[0], p[1], q[0], q[1], color=color, thickness=3)
+                            osd.draw_line(p[0], p[1], q[0], q[1], color=color, thickness=3)
                         # 中心十字
                         mcx = sum(p[0] for p in poly) // 4
                         mcy = sum(p[1] for p in poly) // 4
-                        osd_img.draw_cross(mcx, mcy, color=color, size=8, thickness=2)
+                        osd.draw_cross(mcx, mcy, color=color, size=8, thickness=2)
 
                         tag = " R" if tracker.refined and not holding else ""
                         label_y = draw_y - 40 if draw_y >= 40 else draw_y + draw_h + 5
-                        osd_img.draw_string_advanced(draw_x, label_y, 32,
+                        osd.draw_string_advanced(draw_x, label_y, 32,
                             "{} {:.2f}{}".format(label, tracker.score, tag), color=color)
 
                         info_y = draw_y + draw_h + 5
                         if info_y + 90 > OSD_H:
                             info_y = max(0, draw_y - 90)
-                        osd_img.draw_string_advanced(draw_x, info_y, 24,
+                        osd.draw_string_advanced(draw_x, info_y, 24,
                             "Depth: {:.1f}mm".format(pos['depth_mm']), color=(255, 255, 0))
-                        osd_img.draw_string_advanced(draw_x, info_y + 30, 24,
+                        osd.draw_string_advanced(draw_x, info_y + 30, 24,
                             "X:{:.1f} Y:{:.1f}mm".format(pos['x_mm'], pos['y_mm']), color=(0, 255, 255))
                         extra_y = info_y + 60
                         if pos['angle'] is not None:
-                            osd_img.draw_string_advanced(draw_x, extra_y, 24,
+                            osd.draw_string_advanced(draw_x, extra_y, 24,
                                 "Angle: {:.1f}deg".format(pos['angle']), color=(255, 160, 0))
                             extra_y += 30
                         if pos['touches_edge']:
-                            osd_img.draw_string_advanced(draw_x, extra_y, 24, "EDGE", color=(255, 80, 80))
+                            osd.draw_string_advanced(draw_x, extra_y, 24, "EDGE", color=(255, 80, 80))
 
                         if CALIB_DISTANCE_MM > 0 and not holding and not pos['touches_edge']:
                             calib_sizes.append(pos['size_pix'])
@@ -1237,11 +1388,14 @@ def detection():
                                 calib_sizes = []
 
                         now = time.ticks_ms()
-                        if (not holding and not pos['touches_edge']
+                        depth_ok = not FIX_DEPTH_NONZERO or pos['depth_mm'] >= 1.0
+                        if (not holding and not pos['touches_edge'] and depth_ok
                                 and time.ticks_diff(now, last_send_time) > UART_INTERVAL_MS):
-                            ang_s = "" if pos['angle'] is None else " A:{:.1f}".format(pos['angle'])
-                            print("Object: {} | Conf: {:.2f}{} | X:{:.1f} Y:{:.1f} D:{:.1f}mm{}".format(
-                                label, tracker.score, tag, pos['x_mm'], pos['y_mm'], pos['depth_mm'], ang_s))
+                            if PRINT_OBJECT:
+                                ang_s = "" if pos['angle'] is None else " A:{:.1f}".format(pos['angle'])
+                                print("Object: {} | Conf: {:.2f}{} | X:{:.1f} Y:{:.1f} D:{:.1f}mm S:{:.1f}px{}".format(
+                                    label, tracker.score, tag, pos['x_mm'], pos['y_mm'], pos['depth_mm'],
+                                    pos['size_pix'], ang_s))
                             send_position_via_uart(pos['x_mm'], pos['y_mm'], pos['depth_mm'], verbose=False)
                             last_send_time = now
 
@@ -1257,16 +1411,20 @@ def detection():
                 if dt > 0:
                     frame_dt = dt
                     fps = 0.9 * fps + 0.1 * (1000.0 / dt) if fps > 0 else 1000.0 / dt
-                osd_img.draw_string_advanced(10, OSD_H - 36, 24,
+                osd.draw_string_advanced(10, OSD_H - 36, 24,
                     "FPS {:.1f}".format(fps), color=(200, 200, 200))
                 if calib_text:
-                    osd_img.draw_string_advanced(10, 10, 28, calib_text, color=(255, 0, 255))
+                    osd.draw_string_advanced(10, 10, 28, calib_text, color=(255, 0, 255))
                 prof.mark("pos+draw")
 
-                Display.show_image(osd_img, OSD_X, OSD_Y, Display.LAYER_OSD3)
+                if draw_osd:
+                    Display.show_image(osd_img, OSD_X, OSD_Y, Display.LAYER_OSD3)
                 del np_img
                 frame_no += 1
-                if frame_no % GC_EVERY == 0:
+                if GC_MIN_FREE_KB > 0:
+                    if gc.mem_free() < GC_MIN_FREE_KB * 1024:
+                        gc.collect()
+                elif frame_no % GC_EVERY == 0:
                     gc.collect()
                 prof.mark("show+gc")
                 prof.end_frame()
