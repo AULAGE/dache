@@ -149,10 +149,31 @@ class GraspTask:
                     for b in bases:
                         self.set_base(b)
                         m = self.measure()
+                        if m and c.SEARCH_CONFIRM:
+                            m = self.confirm_target(m)
                         if m:
                             self.say(f"搜索：找到目标（高度 {h}cm，底座 {b:+.0f}°）")
                             return m
                     bases.reverse()          # 下一轮反向扫，少转一大圈
+        return None
+
+    def confirm_target(self, m):
+        """
+        误识别过滤（SEARCH_CONFIRM）：搜索时第一次看到目标，原地再测 1~2 次，位置一致才算真物块。
+        K230 偶尔把别的东西认成物块，但一般只持续几帧；真物块不动，第二次测的位置应该差不多。
+        """
+        c = self.cfg
+        for _ in range(2):
+            m2 = self.measure()
+            if m2 is None:
+                continue
+            same = (abs(m2.d - m.d) <= max(c.CONFIRM_D_MM, c.CONFIRM_D_FRAC * m.d)
+                    and abs(m2.x_deg - m.x_deg) <= c.CONFIRM_X_DEG
+                    and abs(m2.y - m.y) <= max(c.CONFIRM_D_MM, c.CONFIRM_D_FRAC * m.d))
+            if same:
+                return m2
+            m = m2                       # 换成新看到的，再确认一次
+        self.say("搜索：目标没有复现（可能是误识别），继续搜")
         return None
 
     # ------------------------------------------------ 对准
@@ -177,7 +198,8 @@ class GraspTask:
                 u_d = self.axes["d"].command(e["d"], s_d)
 
             base_old = self.base_deg
-            base_new = max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, base_old + u_x))
+            base_want = base_old + u_x
+            base_new = max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, base_want))
             u_x = base_new - base_old
             recenter = c.USE_CHASSIS and abs(base_new) > c.BASE_RECENTER_DEG
             if self.can_turn:
@@ -186,6 +208,12 @@ class GraspTask:
                     u_d = 0.0
             else:
                 # 阿克曼底盘：不能原地转，只能在前进的同时把车头往底座的方向拐（见下面 drive）
+                if (c.BASE_LIMIT_BACKUP_MM > 0 and c.USE_CHASSIS and not u_d
+                        and abs(base_want) > c.BASE_LIMIT_DEG and abs(e["x_deg"]) > c.TOL["x_deg"]):
+                    # 底座已经转到头、深度又刚好：原来会"没法更好"直接去抓（必然抓空）。
+                    # 改成后退一段、同时把车头往物块方向拐，下一步再往前对深度
+                    u_d = -c.BASE_LIMIT_BACKUP_MM
+                    self.say(f"对准：底座到极限 {base_new:+.0f}° 还差 {e['x_deg']:+.1f}°，后退并转车头")
                 recenter = recenter and bool(u_d)
 
             if not (u_y or u_x or u_d or recenter):

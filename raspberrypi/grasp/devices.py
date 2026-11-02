@@ -351,8 +351,15 @@ class WheeltecChassis:
         with self._lock:
             self.cmd = (int(vx), int(wz))
 
+    # 时间函数单独拿出来：仿真（sim.SimWheeltec）用仿真时钟替换，真机行为不变
+    def _now(self):
+        return time.monotonic()
+
+    def _sleep(self, s):
+        time.sleep(s)
+
     def has_feedback(self):
-        return time.monotonic() - self.last_fb < 0.5
+        return self._now() - self.last_fb < 0.5
 
     MIN_SPEED = 30          # mm/s，快到终点时最低指令速度（太低控制器可能不动）
     RAMP_K = 1.5            # 1/s：剩余距离 × RAMP_K = 指令速度上限（越靠近终点越慢）
@@ -379,11 +386,11 @@ class WheeltecChassis:
         with self._lock:
             d0, y0 = self.dist, self.yaw
         fb = self.has_feedback()
-        t0 = time.monotonic()
+        t0 = self._now()
         done_rel = v_rel = None
         try:
             while True:
-                el = time.monotonic() - t0
+                el = self._now() - t0
                 if fb:
                     with self._lock:
                         done = abs(self.dist - d0)
@@ -400,12 +407,12 @@ class WheeltecChassis:
                 self._set(sign * v, curv * v * 1000.0)       # wz 跟着速度变，保证走的是同一条弧线
                 if el > timeout:
                     raise DeviceError("底盘移动超时（被卡住？）")
-                time.sleep(0.02)
+                self._sleep(0.02)
         finally:
             self._set(0, 0)
-        t1 = time.monotonic()                                # 等车停稳
-        while fb and abs(self.fb_vx) > 5 and time.monotonic() - t1 < 1.5:
-            time.sleep(0.02)
+        t1 = self._now()                                # 等车停稳
+        while fb and abs(self.fb_vx) > 5 and self._now() - t1 < 1.5:
+            self._sleep(0.02)
         if not fb:
             return float(mm), dpsi_deg
         with self._lock:
@@ -483,9 +490,15 @@ class Arm:
     CMD_MULT_SERVO_MOVE = 3
     RECONNECT_S = 5.0
 
-    def __init__(self, port, baud, clock):
-        if serial is None:
+    def __init__(self, port, baud, clock, ser_factory=None, robust=False):
+        # ser_factory：仿真注入假串口（sim.SimArmSerial）；真机用 pyserial
+        # robust（config.ARM_USB_ROBUST）：掉线后在 RECONNECT_S 内反复重连；重连后把所有舵机的
+        #   最新位置整帧重发（掉线前那一帧可能写进缓冲区没报错却丢了）；最终失败报 DeviceError
+        self.robust = robust
+        if ser_factory is None and serial is None:
             raise DeviceError("缺少 pyserial：pip install pyserial")
+        self._factory = ser_factory or serial.Serial
+        self._errs = (OSError,) + ((serial.SerialException,) if serial is not None else ())
         self.port, self.baud = port, baud
         self.clock = clock
         self.state = {}
@@ -494,16 +507,16 @@ class Arm:
         self._open(wait_s=2.0)
 
     def _open(self, wait_s):
-        deadline = time.monotonic() + wait_s
+        deadline = self.clock.now() + wait_s
         while True:
             try:
-                self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
+                self.ser = self._factory(self.port, self.baud, timeout=0.1)
                 return
-            except (OSError, serial.SerialException):
-                if time.monotonic() > deadline:
+            except self._errs:
+                if self.clock.now() > deadline:
                     raise DeviceError(f"机械臂串口打不开：{self.port}（USB 线松了 / 机械臂板没上电？"
                                       f"用 `ls -l /dev/serial/by-path/` 看看还在不在）")
-                time.sleep(0.2)
+                self.clock.sleep(0.2)
 
     def move(self, pulses, ms):
         pulses = {int(k): int(max(500, min(2500, v))) for k, v in sorted(pulses.items())}
@@ -517,18 +530,50 @@ class Arm:
         try:
             self.ser.write(frame)
             self.ser.flush()
-        except (OSError, serial.SerialException):
-            # USB 掉了：等它回来，重开串口再发一次
+        except self._errs:
+            if self.robust:
+                self._reconnect_send(pulses, ms)
+            else:
+                # USB 掉了：等它回来，重开串口再发一次
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self._open(wait_s=self.RECONNECT_S)
+                self.reconnects += 1
+                self.ser.write(frame)
+                self.ser.flush()
+        self.state.update(pulses)
+        self.clock.sleep(ms / 1000.0 + 0.15)
+
+
+    def _frame(self, pulses, ms):
+        n = len(pulses)
+        frame = bytearray([0x55, 0x55, 3 * n + 5, self.CMD_MULT_SERVO_MOVE, n, ms & 0xFF, (ms >> 8) & 0xFF])
+        for sid, p in pulses.items():
+            frame += bytes([sid, p & 0xFF, (p >> 8) & 0xFF])
+        return frame
+
+    def _reconnect_send(self, pulses, ms):
+        """robust 模式：RECONNECT_S 内反复重开串口，成功后发 {之前所有舵机的位置 + 这一帧}"""
+        deadline = self.clock.now() + self.RECONNECT_S
+        full = {**self.state, **pulses}
+        frame = self._frame(dict(sorted(full.items())), ms)
+        while True:
             try:
                 self.ser.close()
             except Exception:
                 pass
-            self._open(wait_s=self.RECONNECT_S)
+            self._open(wait_s=max(0.2, deadline - self.clock.now()))   # 超时会报 DeviceError
             self.reconnects += 1
-            self.ser.write(frame)
-            self.ser.flush()
-        self.state.update(pulses)
-        self.clock.sleep(ms / 1000.0 + 0.15)
+            try:
+                self.ser.write(frame)
+                self.ser.flush()
+                return
+            except self._errs:
+                if self.clock.now() > deadline:
+                    raise DeviceError("机械臂 USB 反复掉线，重连失败（检查 USB 线和舵机供电）")
+                self.clock.sleep(0.2)
 
 
 def lerp_pose(a, b, t):

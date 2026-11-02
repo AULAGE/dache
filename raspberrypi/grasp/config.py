@@ -54,6 +54,27 @@ FOV_Y_DEG = 25
 K230_FPS = 7              # 实测约 7 帧/秒（--check 时 2 秒 14 帧），只用于仿真
 SIM_MAX_DETECT_MM = 900   # 仿真：超过这个距离认为 24mm 的物块太小、识别不出来
 
+# ======================= 仿真真实度（只影响 sim.py，真机不用；任务 02） =======================
+# 每一项都可以单独关掉做对比（python3 sim_compare.py 逐项对比）。标"估计"的是没有实测、按常识给的值
+SIM_K230_TRACKER = True        # 1 逐帧模拟 K230 跟踪器（中值+EMA 滞后、丢帧时预测但不发、2 帧确认）
+SIM_K230_TRACKER_FILTER = True #   False = 逐帧但不过跟踪器（只用于分析）
+SIM_BLUR_DETECT_P = 0.5        #   动作进行中每帧还能检出物块的概率（估计）
+SIM_CHASSIS_DYNAMICS = True    # 2 仿真底盘走真机同一套 WheeltecChassis.drive()，假控制器一阶滞后会滑行
+SIM_CHASSIS_TAU_S = 0.45       #   真实滑行时间常数（实测 100mm/s 滑约 45mm），每台车再 ±10%（估计）
+SIM_SERVO_DEADBAND_US = 5      # 3 舵机死区：和当前位置差小于这个的指令不动（0 = 关；估计值）
+SIM_SERVO_BACKLASH_US = 10     #   换方向回差（0 = 关；估计值）
+SIM_PUSH_P = 0.3               # 4 伸出时有小偏差 → 把物块推开的概率（0 = 关；估计值）
+SIM_PUSH_RANGE = (0.3, 2.0)    #   "小偏差"：偏差 / 抓取容差 在这个范围内才可能推到
+SIM_PUSH_MM = (10, 30)         #   推开多远
+SIM_DEPTH_NONLINEAR = True     # 5 尺寸法测深：每帧框边像素噪声 + 每台车固定的框边长偏差 → 误差 ∝ 距离²
+SIM_PIX_NOISE = 0.5            #   每条框边的像素噪声（px，估计）
+SIM_BOX_BIAS_PX = 1.0          #   框边长固定偏差 ±px（颜色精修边界，估计）
+SIM_ARM_USB_DROP_P = 0.01      # 6 每发一帧机械臂指令，CH340 掉线的概率（0 = 关；估计值）
+SIM_ARM_USB_DROP_S = (0.5, 2.0)  # 掉线多久（实测会这样）
+SIM_ARM_USB_SILENT_P = 0.3     #   掉线那一帧已写进缓冲区、没报错但丢了的比例（估计）
+SIM_FALSE_TARGET_P = 0.005     # 7 每帧冒出一个假目标的概率（约 30 秒一次，估计）
+SIM_FALSE_TARGET_FRAMES = (2, 5)  # 假目标持续几帧
+
 # ======================= 对准目标 =======================
 # [标定] 机械臂在 observe 姿态时，把物块放到"机械臂伸出去刚好能抓到"的位置，
 #        K230 读到的 X、Y、深度填这里（x_deg = atan(X/深度)，单位度）
@@ -89,6 +110,9 @@ BASE_LIMIT_DEG = 85.0     # 底座最大转角（以 observe 姿态的底座为 
 BASE_MS_PER_DEG = 6.0     # 底座转动用时（ms/度），太快相机会晃
 # 有底盘时：底座转出去超过这个角度，就让底盘转过去、底座回正（车头对准物块再前进）
 BASE_RECENTER_DEG = 12.0
+# 阿克曼：底座转到 BASE_LIMIT_DEG 还没对准、深度又已经在容差内时，后退这么多并把车头往物块方向拐（任务 02
+# 仿真发现：原来会判定"没法更好"直接去抓，必然抓空，观察确认还可能误判成抓到）。0 = 原行为
+BASE_LIMIT_BACKUP_MM = 0
 
 # ======================= 搜索 =======================
 SEARCH_BASE_DEG = [0, -55, 55, -85, 85]   # 每个高度底座依次转到这些角度看（覆盖约 ±120°）
@@ -98,6 +122,12 @@ SEARCH_LIFT_CM = [25, 10, 40]    # 依次在这些高度搜索（中间高度先
 SEARCH_LIFT_CM_NEAR = [25, 15, 35, 5, 45]
 SEARCH_BASE_DEG_NEAR = [0, -30, 30, -60, 60]
 SEARCH_BACKOFF_MM = 250          # 都没找到：底盘后退这么多再搜一遍（物块太近时上下视野太窄会漏掉）
+# 误识别过滤（任务 02 仿真发现）：搜索时第一次看到目标，原地再测 1~2 次，位置一致才采信。
+# False = 原行为（看到就采信）。打开后每次找到目标多花约 1 秒
+SEARCH_CONFIRM = False
+CONFIRM_D_MM = 30.0              # 两次测量深度 / y 差不超过 max(这个值, 深度 × CONFIRM_D_FRAC)
+CONFIRM_D_FRAC = 0.15
+CONFIRM_X_DEG = 3.0              # 方位角差不超过这个值
 
 # ======================= 机械臂 =======================
 # Lobot 控制板：id 1 = 爪子，2 = 腕部（相机在这节上），3/4/5 = 臂，6 = 底座；脉宽 500~2500us
@@ -127,6 +157,9 @@ REACH_FAR_D = 200.0
 REACH_RANGE_OK = True     # 深度超出这个范围时仍尝试（姿态截断到边界）
 ARM_MOVE_MS = 1000        # 一般动作时间（arm.txt 里每帧都是 1000ms）
 ARM_SLOW_MS = 1200        # 伸向物块时放慢
+# 机械臂 USB 掉线保护（任务 02 仿真发现）：False = 原行为（掉线只重连重发一次，重连后马上又掉会抛
+# 串口异常、主程序退出）；True = RECONNECT_S 内反复重连、重连后把所有舵机位置整帧重发、失败报设备错误
+ARM_USB_ROBUST = False
 LIFT_AFTER_GRASP_CM = 5.0 # 合爪后升降轴上抬多少
 
 # 抓取后判断是否成功：
@@ -158,7 +191,8 @@ CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "GOAL", "TOL", "R_CAM_MM", "BASE_DIR", "BASE_CENTER", "BASE_US_PER_DEG", "CLAW_OPEN", "CLAW_CLOSE",
     "REACH_NEAR_D", "REACH_FAR_D", "POSES_CALIBRATED", "ACK_MIN_RADIUS_MM", "K230_ROTATE", "LIFT_MAX_CM",
     "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
-    "ARM_SLOW_MS", "STEP_ALPHA",
+    "ARM_SLOW_MS", "STEP_ALPHA", "ARM_USB_ROBUST", "SEARCH_CONFIRM", "CONFIRM_D_MM", "CONFIRM_D_FRAC",
+    "CONFIRM_X_DEG", "BASE_LIMIT_BACKUP_MM",
 }
 
 
