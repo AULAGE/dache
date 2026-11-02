@@ -85,6 +85,24 @@ def test_arm():
     arm.move({1: 500}, 300)
     check("USB 掉线后自动重开串口并重发", len(sent) == n0 + 1 and arm.reconnects == 1 and state["opens"] == 2)
 
+    # 重连后马上又掉一次（接触不良时会这样）：原行为抛串口异常；robust 模式反复重连并整帧重发所有舵机
+    state.update(fail=2, opens=0)
+    arm = devices.Arm("x", 9600, clock)
+    arm.state = {6: 1600, 3: 758}
+    try:
+        arm.move({1: 500}, 300)
+        check("连续掉两次：原行为抛异常（ARM_USB_ROBUST=False）", False)
+    except FakeSerialException:
+        check("连续掉两次：原行为抛异常（ARM_USB_ROBUST=False）", True)
+    state.update(fail=2, opens=0)
+    arm = devices.Arm("x", 9600, clock, robust=True)
+    arm.state = {6: 1600, 3: 758}
+    n0 = len(sent)
+    arm.move({1: 500}, 300)
+    want = bytes.fromhex("55 55 0E 03 03 2C 01 01 F4 01 03 F6 02 06 40 06")
+    check("连续掉两次：robust 模式重连成功，整帧重发所有舵机", len(sent) == n0 + 1 and sent[-1] == want
+          and arm.reconnects == 2, sent[-1].hex(" "))
+
 
 # ------------------------------------------------------------ K230 帧解析
 def test_k230():
@@ -544,6 +562,100 @@ def test_geometry():
         cfg.GOAL.update(g0)
 
 
+# ------------------------------------------------------------ 仿真真实度（任务 02 新增的因素）
+def test_sim_factors():
+    print("仿真真实度因素（任务 02）")
+    import config as cfg
+    import sim
+    from task import GraspTask
+    importlib.reload(cfg)
+    cfg.POSES = sim.SIM_POSES
+    car = {"box_bias_px": 0.0, "coast_tau": 0.45}
+    try:
+        # 2 底盘：一阶滞后假控制器 + 真机 drive 逻辑
+        w, clock, cam, lift, arm, ch = sim.make_sim(cfg, 3, 1.0, 150, dict(car))
+        check("仿真底盘走真机 WheeltecChassis.drive", isinstance(ch, devices.WheeltecChassis))
+        ch.cmd = (100, 0)
+        for _ in range(300):
+            ch._plant(0.01)
+        x0 = w.robot[0]
+        ch.cmd = (0, 0)
+        for _ in range(500):
+            ch._plant(0.01)
+        coast = w.robot[0] - x0
+        check("100mm/s 松油门滑行约 45mm（README 实测）", 40 < coast < 50, f"{coast:.1f}mm")
+        errs = [ch.drive(mm)[0] - mm for mm in (100, 100, -100, 150)]
+        check("仿真底盘：走 2 次后里程停车误差 ≤ 8mm", all(abs(e) <= 8 for e in errs[2:]),
+              " ".join(f"{e:+.1f}" for e in errs))
+
+        # 1 K230 跟踪器：小动作后第一帧带滞后，之后收敛
+        cfg.USE_CHASSIS = False
+        w, clock, cam, lift, arm, ch = sim.make_sim(cfg, 3, 1.0, 150, dict(car))
+        w.block = [80 + 150 + 300, 0, w.CAM_Z0]
+        arm.move({**cfg.POSES["observe"], 6: 1500, 1: 500}, 1000)
+        clock.sleep(2)
+        cam._advance(clock.now())
+        n0 = len(cam.sent)
+        arm.move({6: 1533}, 150)              # 底座右转约 3°
+        clock.sleep(1.5)
+        cam._advance(clock.now())
+        xt = w.true_view()[0]
+        xs = [f[1] for f in cam.sent[n0:]]
+        check("跟踪器：动作后第一帧是滞后的旧位置", bool(xs) and abs(xs[0] - xt) > 0.3 * abs(xt),
+              f"第一帧 {xs[0]:.1f}，真实 {xt:.1f}" if xs else "没有帧")
+        check("跟踪器：1 秒后收敛", bool(xs) and abs(xs[-1] - xt) < 1.5, f"{xs[-1]:.1f}" if xs else "")
+
+        # 3 舵机死区 / 回差
+        b0 = w.base_deg
+        arm.move({6: 1536}, 150)              # 3us：在死区里
+        check("舵机死区：3us 的指令不动", w.base_deg == b0)
+        arm.move({6: 1600}, 300)
+        up = arm.base_out
+        arm.move({6: 1700}, 300)
+        arm.move({6: 1600}, 300)
+        check("舵机回差：从两边到同一位置差约 10us",
+              abs(abs(arm.base_out - up) - cfg.SIM_SERVO_BACKLASH_US) < 1e-6, f"{up:.0f} / {arm.base_out:.0f}")
+
+        # 4 伸出时碰歪物块
+        cfg.SIM_PUSH_P = 1.0
+        w, clock, cam, lift, arm, ch = sim.make_sim(cfg, 3, 1.0, 150, dict(car))
+        w.block = [80 + 150 + 170, -170 * math.tan(math.radians(1.5)), w.CAM_Z0]   # 偏右 1.5°（抓取容差的一半）
+        b = list(w.block)
+        arm.move(cfg.POSES["reach_near"], 1000)
+        moved = math.hypot(w.block[0] - b[0], w.block[1] - b[1])
+        check("小偏差伸出：物块被推开 10~30mm", w.pushes == 1 and 10 <= moved <= 30, f"{moved:.1f}mm")
+        cfg.SIM_PUSH_P = 0.3
+
+        # 5 深度非线性：固定的框边长偏差 → 相对误差随距离线性增长（绝对误差 ∝ 距离²）
+        w.car = {"box_bias_px": 1.0, "coast_tau": 0.45}
+        e160 = w.measured_clean((0, 0, 160))[2] - 160
+        e900 = w.measured_clean((0, 0, 900))[2] - 900
+        check("尺寸法测深：900mm 处误差约是 160mm 处的 (900/160)² 倍", 25 < e900 / e160 < 35,
+              f"{e160:+.2f} / {e900:+.1f}mm")
+
+        # 6 USB 掉线：走真机 Arm.move 的重连逻辑
+        w, clock, cam, lift, arm, ch = sim.make_sim(cfg, 3, 1.0, 150, dict(car))
+        arm.down_until = clock.now() + 1.0
+        arm.usb_gen += 1
+        t0 = clock.now()
+        arm.move({6: 1700}, 300)
+        check("USB 掉线 1s：Arm 等它回来、重连后指令生效",
+              arm.reconnects == 1 and abs(w.base_deg - 200 / 11.1) < 1 and clock.now() - t0 >= 1.0,
+              f"用时 {clock.now() - t0:.1f}s")
+
+        # 7 误识别：SEARCH_CONFIRM 能过滤只出现一次的假目标
+        seq = [None, None]
+        fake_cam = types.SimpleNamespace(measure=lambda *a: seq.pop(0) if seq else None)
+        t = GraspTask(cfg, clock, fake_cam, lift, arm, ch, verbose=False)
+        check("SEARCH_CONFIRM：复测看不到的目标不采信", t.confirm_target(devices.Measurement(50, 0, 400, 5)) is None)
+        seq[:] = [devices.Measurement(52, 1, 405, 5)]
+        check("SEARCH_CONFIRM：复测一致的目标采信", t.confirm_target(devices.Measurement(50, 0, 400, 5)) is not None)
+        seq[:] = [devices.Measurement(-80, 30, 250, 5), None]
+        check("SEARCH_CONFIRM：复测位置对不上的不采信", t.confirm_target(devices.Measurement(50, 0, 400, 5)) is None)
+    finally:
+        importlib.reload(cfg)
+
+
 # ------------------------------------------------------------ 仿真回归
 def test_sim():
     print("仿真回归（整套流程）")
@@ -553,14 +665,19 @@ def test_sim():
     import main
     saved = (cfg.POSES, cfg.USE_CHASSIS)
     try:
-        for n, seed, nc, need in ((40, 31, False, 0.85), (30, 33, True, 0.85)):
+        fixes = {"ARM_USB_ROBUST": True, "SEARCH_CONFIRM": True, "BASE_LIMIT_BACKUP_MM": 150}
+        for n, seed, nc, need, extra in ((40, 31, False, 0.85, {}), (30, 33, True, 0.85, {}),
+                                         (40, 31, False, 0.85, fixes)):
             importlib.reload(cfg)
+            for k, v in extra.items():
+                setattr(cfg, k, v)
             main.cfg = cfg
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rate = main.run_sim(n, seed, True, nc)
             line = [l for l in buf.getvalue().splitlines() if l.startswith("全部")][0]
-            check(f"{'无' if nc else '有'}底盘 {n} 次，真实抓到 ≥ {need:.0%}", rate >= need, line.split(":", 1)[1].strip())
+            check(f"{'无' if nc else '有'}底盘 {n} 次{'（打开任务 02 的改进开关）' if extra else ''}，"
+                  f"真实抓到 ≥ {need:.0%}", rate >= need, line.split(":", 1)[1].strip())
     finally:
         importlib.reload(cfg)
         main.cfg = cfg
@@ -569,8 +686,8 @@ def test_sim():
 if __name__ == "__main__":
     quick = len(sys.argv) > 1 and sys.argv[1] == "quick"
     real_serial = devices.serial
-    for t in (test_arm, test_k230, test_lift, test_chassis, test_chassis_fw, test_calib_override, test_step_and_guard,
-              test_geometry):
+    for t in (test_arm, test_k230, test_lift, test_chassis, test_chassis_fw, test_calib_override,
+              test_step_and_guard, test_geometry, test_sim_factors):
         try:
             t()
         except Exception as e:

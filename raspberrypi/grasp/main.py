@@ -35,7 +35,7 @@ LOG_DIR = os.path.join(HERE, cfg.LOG_DIR)
 def run_sim(n, seed, learn, no_chassis=False):
     import random
     import tempfile
-    from sim import SIM_POSES, make_sim
+    from sim import SIM_POSES, make_car, make_sim
 
     cfg.POSES = SIM_POSES                 # 仿真用可区分的姿态值
     if no_chassis:
@@ -47,18 +47,32 @@ def run_sim(n, seed, learn, no_chassis=False):
           f"相机真实半径 {r_cam:.0f}mm（配置 {cfg.R_CAM_MM:.0f}mm）  学习 {'开' if learn else '关'}")
 
     log_dir = tempfile.mkdtemp(prefix="grasp_sim_") if learn else None
+    car = make_car(cfg, seed)              # 同一台车：滑行 τ、测深框偏差等固定
     rows, truth = [], []
     task = None
     for i in range(n):
-        world, clock, cam, lift, arm, chassis = make_sim(cfg, seed * 1000 + i, bias, r_cam)
+        world, clock, cam, lift, arm, chassis = make_sim(cfg, seed * 1000 + i, bias, r_cam, car)
+        if task is not None and hasattr(task.chassis, "coast_tau") and hasattr(chassis, "coast_tau"):
+            chassis.coast_tau = task.chassis.coast_tau     # 真机把学到的 τ 存文件，下次接着用
         if task is None:
             task = GraspTask(cfg, clock, cam, lift, arm, chassis, log_dir=log_dir, learn=learn,
                              verbose=(n == 1))
         else:       # 换一个新场景，但保留学到的灵敏度（模拟同一台车反复使用）
             task.clock, task.cam, task.lift, task.arm, task.chassis = clock, cam, lift, arm, chassis
             task.base_deg = 0.0
-        rows.append(task.run_once())
-        truth.append(world.picked)
+        ok_end = True
+        try:
+            rows.append(task.run_once())
+        except Exception as e:      # 真机上 DeviceError 会重开设备再来，其它异常会让程序退出：都算这次失败
+            kind = "device_error" if isinstance(e, DeviceError) else "crash"
+            if n == 1:
+                print(f"异常（{kind}）：{e!r}")
+            rows.append({"episode": i + 1, "result": kind, "attempts": 0, "steps": 0,
+                         "time_s": round(clock.now(), 1), "err_norm": 0.0,
+                         "score": round(-cfg.SCORE_TIME_COST * clock.now(), 1)})
+            task._lifted = False
+            ok_end = world.removed          # 中途出错：已经放进筐里才算抓到
+        truth.append(world.picked if ok_end else world.removed)
 
     def stats(rs, tr, title):
         ok = sum(tr)
@@ -98,7 +112,7 @@ def chassis_options(c):
 def open_devices(clock):
     cam = K230(cfg.PORTS["k230"], cfg.BAUD["k230"], clock, cfg.TARGET_TIMEOUT_S, cfg.K230_ROTATE)
     lift = Lift(cfg.PORTS["lift"], cfg.BAUD["lift"], cfg.LIFT_MAX_CM)
-    arm = Arm(cfg.PORTS["arm"], cfg.BAUD["arm"], clock)
+    arm = Arm(cfg.PORTS["arm"], cfg.BAUD["arm"], clock, robust=cfg.ARM_USB_ROBUST)
     chassis = WheeltecChassis(cfg.PORTS["chassis"], cfg.BAUD["chassis"], cfg.CHASSIS_SPEED_MM_S,
                               cfg.ACK_MIN_RADIUS_MM, cfg.CHASSIS_ACKERMANN,
                               os.path.join(LOG_DIR, "chassis_tau.json"), **chassis_options(cfg)) \
