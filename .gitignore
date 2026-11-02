@@ -1,0 +1,38 @@
+# ===== Keil 编译产物（重新编译就有）=====
+Obj/
+OBJ/
+Objects/
+Listings/
+*.o
+*.d
+*.crf
+*.axf
+*.lst
+*.map
+*.lnp
+*.sct
+*.dep
+*.htm
+*.iex
+*.tra
+*.__i
+*_sct.Bak
+JLinkLog.txt
+JLinkSettings.ini
+
+# ===== Keil 每个人自己的窗口布局 / 自动备份 =====
+*.uvguix.*
+*.uvgui.*
+*.uvgui_*.bak
+*_uvopt.bak
+*_uvproj.bak
+*_uvoptx.bak
+*_uvprojx.bak
+
+# ===== Python =====
+__pycache__/
+*.pyc
+
+# ===== 运行时生成的（每台车不同，在树莓派上产生）=====
+raspberrypi/grasp/logs/
+*.tmp

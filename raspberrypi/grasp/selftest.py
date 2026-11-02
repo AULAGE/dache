@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""
+离线自测：不接任何硬件，用假的下位机把每个驱动和整套流程测一遍。
+改完代码先跑它，全部 ✅ 再上真机。
+
+  python3 selftest.py          全部测试（约 1 分钟）
+  python3 selftest.py quick    跳过耗时的仿真回归
+"""
+import importlib
+import json
+import math
+import os
+import sys
+import tempfile
+import threading
+import time
+import types
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+import devices  # noqa: E402
+
+PASS, FAIL = [], []
+
+
+def check(name, ok, detail=""):
+    (PASS if ok else FAIL).append(name)
+    print(("  ✅ " if ok else "  ❌ ") + name + (f"   {detail}" if detail else ""))
+
+
+class FakeSerialException(OSError):
+    pass
+
+
+def install_fake(factory):
+    devices.serial = types.SimpleNamespace(Serial=factory, SerialException=FakeSerialException)
+
+
+# ------------------------------------------------------------ 机械臂：和 arm.txt 逐字节比对
+def test_arm():
+    print("机械臂协议（和 ~/arm.txt 里 Lobot 上位机录的帧比对）")
+    sent = []
+
+    class S:
+        def __init__(self, *a, **k):
+            pass
+
+        def write(self, b):
+            sent.append(bytes(b))
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    install_fake(S)
+    clock = types.SimpleNamespace(sleep=lambda s: None, now=time.monotonic)
+    arm = devices.Arm("x", 9600, clock)
+    # arm.txt 第 1 行和第 8 行
+    arm.move({6: 1500, 1: 1500, 2: 1500, 3: 758, 4: 601, 5: 1185}, 1000)
+    arm.move({1: 500, 2: 1500, 3: 758, 4: 714, 5: 1724, 6: 2287}, 500)
+    want1 = bytes.fromhex("55 55 17 03 06 E8 03 01 DC 05 02 DC 05 03 F6 02 04 59 02 05 A1 04 06 DC 05")
+    want8 = bytes.fromhex("55 55 17 03 06 F4 01 01 F4 01 02 DC 05 03 F6 02 04 CA 02 05 BC 06 06 EF 08")
+    check("初始姿态帧与 arm.txt 第 1 行一致", sent[0] == want1, sent[0].hex(" "))
+    check("松爪帧与 arm.txt 第 8 行一致", sent[1] == want8)
+
+    # USB 掉线后自动重连
+    state = {"fail": 1, "opens": 0}
+
+    class Flaky(S):
+        def __init__(self, *a, **k):
+            state["opens"] += 1
+
+        def write(self, b):
+            if state["fail"]:
+                state["fail"] -= 1
+                raise FakeSerialException("device disconnected")
+            sent.append(bytes(b))
+
+    install_fake(Flaky)
+    arm = devices.Arm("x", 9600, clock)
+    n0 = len(sent)
+    arm.move({1: 500}, 300)
+    check("USB 掉线后自动重开串口并重发", len(sent) == n0 + 1 and arm.reconnects == 1 and state["opens"] == 2)
+
+
+# ------------------------------------------------------------ K230 帧解析
+def test_k230():
+    print("K230 帧解析")
+
+    def fr(x, y, d):
+        f = bytearray([0xAA, 0x55]) + (x & 0xFFFF).to_bytes(2, "big") + (y & 0xFFFF).to_bytes(2, "big") \
+            + d.to_bytes(2, "big")
+        return bytes(f) + bytes([devices.crc8(f), 0x0D])
+
+    chunks = [b"\x12\xaa", fr(-47, 97, 382)[:4], fr(-47, 97, 382)[4:], fr(0, 0, 0), b"\xaa\x55\x00",
+              fr(10, -5, 200)]
+    bad = bytearray(fr(1, 2, 3))
+    bad[8] ^= 0xFF
+    chunks.append(bytes(bad))
+
+    class S:
+        def __init__(self, *a, **k):
+            pass
+
+        def read(self, n):
+            time.sleep(0.005)
+            return chunks.pop(0) if chunks else b""
+
+    install_fake(S)
+    cam = devices.K230("x", 115200, devices.RealClock(), 0.4)
+    time.sleep(0.2)
+    got = [f[1:] for f in cam.frames]
+    check("位置帧（含被拆成两半的帧）", got == [(-47, 97, 382), (10, -5, 200)], str(got))
+    check("心跳帧计数、不当成物块", cam.heartbeats == 1)
+    check("CRC 错的帧被丢弃", cam.bad_frames >= 1)
+    check("link_ok / visible", cam.link_ok() and cam.visible())
+    m = cam.measure(0, 2, 0.1)
+    check("measure 取中位数", m is not None and m.n == 2)
+    cam.close()
+    check("坐标旋转 90°", devices.rotate_xy(10, 20, 90) == (20, -10))
+
+
+# ------------------------------------------------------------ 升降轴：假 STM32
+class FakeLiftMCU:
+    """按 伺服电机控制 固件的协议回话"""
+
+    def __init__(self, homed=True):
+        self.pos = 0.0
+        self.homed = homed
+        self.out = []
+        self.rx = b""
+        self.cmds = []
+
+    def __call__(self, *a, **k):
+        return self
+
+    def write(self, b):
+        self.rx += b
+        while b"\n" in self.rx:
+            line, self.rx = self.rx.split(b"\n", 1)
+            self.handle(line.decode().strip())
+
+    def handle(self, line):
+        if not line:
+            return
+        self.cmds.append(line)
+        c = line[0].upper()
+        if c == "P":
+            self.out.append(f"POS {self.pos:.2f} {'IDLE' if self.homed else 'UNHOMED'}")
+        elif c == "A":
+            t = float(line[1:])
+            if not 0 <= t <= 50:
+                self.out.append("ERR RANGE 0.00-50.00")
+                return
+            self.out.append(f"OK GO {t:.2f}")
+            self.pos = t
+            self.out.append(f"DONE {t:.2f}")
+        elif c == "E":
+            self.out.append("OK E")
+        else:
+            self.out.append("ERR UNKNOWN")
+
+    def readline(self):
+        return (self.out.pop(0) + "\r\n").encode() if self.out else b""
+
+    def reset_input_buffer(self):
+        self.out.clear()
+
+    def close(self):
+        pass
+
+
+def test_lift():
+    print("升降轴协议（假 STM32）")
+    mcu = FakeLiftMCU()
+    install_fake(mcu)
+    lift = devices.Lift("x", 115200, max_cm=44)
+    check("打开串口先发空行清缓冲", mcu.rx == b"" and not mcu.cmds)
+    check("position", lift.position() == 0.0)
+    check("move_to 10", lift.move_to(10) == 10.0)
+    check("软件上限：move_to(60) 截断到 44", lift.move_to(60) == 44.0, mcu.cmds[-1])
+    lift.move_to(40)
+    check("move_by(+10) 从 40 截断到 44", lift.move_by(10) == 44.0)
+    check("move_by(-50) 截断到 0", lift.move_by(-50) == 0.0)
+    lift.start_move_by(5)
+    check("start_move_by + wait_move", lift.wait_move() == 5.0)
+    mcu2 = FakeLiftMCU(homed=False)
+    install_fake(mcu2)
+    try:
+        devices.Lift("x", 115200).position()
+        check("UNHOMED 报错", False)
+    except devices.DeviceError as e:
+        check("UNHOMED 报错", "UNHOMED" in str(e))
+
+
+# ------------------------------------------------------------ 底盘：带平滑减速的假控制器
+def test_chassis(tau_true=0.45):
+    print(f"底盘里程控制（假控制器：滑行时间常数 {tau_true}s）")
+
+    class S:
+        def __init__(self, *a, **k):
+            self.cmd_v = 0.0
+            self.v = 0.0
+            self.t = time.monotonic()
+
+        def write(self, b):
+            if len(b) == 11 and b[0] == 0x7B:
+                self.cmd_v = int.from_bytes(b[3:5], "big", signed=True)
+
+        def read(self, n):
+            time.sleep(0.05)
+            now = time.monotonic()
+            dt, self.t = now - self.t, now
+            self.v += (self.cmd_v - self.v) * min(1, dt / tau_true)
+            vx = int(self.v) & 0xFFFF
+            f = bytearray([0x7B, 0, vx >> 8, vx & 0xFF] + [0] * 16 + [0x64, 0xF6])
+            b = 0
+            for x in f:
+                b ^= x
+            return bytes(f + bytes([b, 0x7D]))
+
+        def close(self):
+            pass
+
+    install_fake(S)
+    tau_file = os.path.join(tempfile.mkdtemp(), "tau.json")
+    c = devices.WheeltecChassis("x", 115200, speed_mm_s=100, tau_file=tau_file)
+    check("收到回传、电压解析", c.has_feedback() and abs(c.voltage_mv - 25846) < 1, f"{c.voltage_mv}mV")
+    errs = []
+    for mm in (100, 100, -100, 150):
+        moved, _ = c.drive(mm)
+        errs.append(abs(moved) - abs(mm))
+    c.close()
+    check("走 2 次后停车误差 ≤ 8mm", all(abs(e) <= 8 for e in errs[2:]), " ".join(f"{e:+.1f}" for e in errs))
+    check("学到的 τ 存进文件", os.path.exists(tau_file))
+    c2 = devices.WheeltecChassis("x", 115200, tau_file=tau_file)
+    check("下次启动读回 τ", abs(c2.coast_tau - json.load(open(tau_file))["coast_tau"]) < 1e-9)
+    c2.close()
+    try:
+        c2.turn(30)
+        check("阿克曼不能原地转（报错）", False)
+    except devices.DeviceError:
+        check("阿克曼不能原地转（报错）", True)
+
+
+# ------------------------------------------------------------ calib.json 覆盖
+def test_calib_override():
+    print("calib.json 覆盖 config")
+    import config
+    path = config.CALIB_FILE
+    if os.path.exists(path):
+        check("（跳过：已有真实的 calib.json，不覆盖它）", True)
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"GOAL": {"x_deg": 1, "y": 2, "d": 150}, "POSES": {"observe": {"2": 1400}},
+                       "AXES_J0": {"y": 9.5}, "BASE_DIR": -1, "NOT_ALLOWED": 1}, f)
+        importlib.reload(config)
+        check("白名单参数被覆盖", config.GOAL["d"] == 150 and config.BASE_DIR == -1 and config.AXES["y"]["j0"] == 9.5)
+        check("姿态只覆盖写了的舵机字典", config.POSES["observe"] == {2: 1400})
+        check("不在白名单的忽略", not hasattr(config, "NOT_ALLOWED"))
+    finally:
+        os.remove(path)
+        importlib.reload(config)
+    check("删掉 calib.json 恢复默认", config.GOAL["d"] == 160.0)
+
+
+# ------------------------------------------------------------ 单步模式 / 手柄接管
+def test_step_and_guard():
+    print("单步模式、手柄接管")
+    import builtins
+    import main
+    calls = []
+    dev = types.SimpleNamespace(move_to=lambda cm: calls.append(cm) or cm, position=lambda: 1.0)
+    p = main.StepProxy(dev, "升降轴")
+    old = builtins.input
+    try:
+        builtins.input = lambda prompt="": ""
+        check("回车 → 执行", p.move_to(3.0) == 3.0 and calls == [3.0])
+        check("非运动方法不询问", p.position() == 1.0)
+        builtins.input = lambda prompt="": "q"
+        try:
+            p.move_to(4.0)
+            check("q → 停止", False)
+        except KeyboardInterrupt:
+            check("q → 停止", calls == [3.0])
+    finally:
+        builtins.input = old
+
+    import config as cfg
+    from sim import SIM_POSES, make_sim
+    from task import GraspTask
+    saved = cfg.POSES
+    cfg.POSES = SIM_POSES
+    try:
+        world, clock, cam, lift, arm, ch = make_sim(cfg, 1, 1.0, cfg.R_CAM_MM)
+        guard = types.SimpleNamespace(active=True)
+        t = GraspTask(cfg, clock, cam, lift, arm, ch, verbose=False, guard=guard)
+        try:
+            t.run_once()
+            check("手柄接管时立即停止任务", False)
+        except devices.ManualOverride:
+            check("手柄接管时立即停止任务", True)
+    finally:
+        cfg.POSES = saved
+
+
+# ------------------------------------------------------------ 几何前馈
+def test_geometry():
+    print("几何前馈（底座角度）")
+    import config as cfg
+    from task import GraspTask
+    t = GraspTask.__new__(GraspTask)
+    t.cfg = cfg
+    g0 = dict(cfg.GOAL)
+    cfg.GOAL["x_deg"] = 0.0
+    try:
+        m = devices.Measurement(0, 0, 300, 5)
+        check("物块正前方、车不动 → 底座不动", abs(t.base_after_move(m, 0, 0, 0)) < 1e-6)
+        check("物块在右 → 底座往右（正）", t.base_after_move(devices.Measurement(50, 0, 300, 5), 0, 0, 0) > 0)
+        # 车头左转 10°（右转 -10）、不平移：底座要往右补约 10°
+        b = t.base_after_move(m, 0, 0, -10)
+        check("车头左转 10° → 底座右补约 10°", 8 < b < 12, f"{b:.2f}")
+        # 物块在左前方，车往前走：物块相对车更偏左 → 底座要往左多转
+        m2 = devices.Measurement(0, 0, 300, 5)
+        b2 = t.base_after_move(m2, -40, 150, 0)
+        check("侧方物块 + 前进 → 底座往同侧多转（平移视差）", b2 < -40, f"{b2:.2f}")
+    finally:
+        cfg.GOAL.update(g0)
+
+
+# ------------------------------------------------------------ 仿真回归
+def test_sim():
+    print("仿真回归（整套流程）")
+    import io
+    import contextlib
+    import config as cfg
+    import main
+    saved = (cfg.POSES, cfg.USE_CHASSIS)
+    try:
+        for n, seed, nc, need in ((40, 31, False, 0.85), (30, 33, True, 0.85)):
+            importlib.reload(cfg)
+            main.cfg = cfg
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rate = main.run_sim(n, seed, True, nc)
+            line = [l for l in buf.getvalue().splitlines() if l.startswith("全部")][0]
+            check(f"{'无' if nc else '有'}底盘 {n} 次，真实抓到 ≥ {need:.0%}", rate >= need, line.split(":", 1)[1].strip())
+    finally:
+        importlib.reload(cfg)
+        main.cfg = cfg
+
+
+if __name__ == "__main__":
+    quick = len(sys.argv) > 1 and sys.argv[1] == "quick"
+    real_serial = devices.serial
+    for t in (test_arm, test_k230, test_lift, test_chassis, test_calib_override, test_step_and_guard,
+              test_geometry):
+        try:
+            t()
+        except Exception as e:
+            check(f"{t.__name__} 崩溃", False, repr(e))
+        finally:
+            devices.serial = real_serial
+    if not quick:
+        test_sim()
+    print(f"\n通过 {len(PASS)} 项，失败 {len(FAIL)} 项" + ("" if not FAIL else "：" + "；".join(FAIL)))
+    sys.exit(1 if FAIL else 0)

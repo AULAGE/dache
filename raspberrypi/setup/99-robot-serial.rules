@@ -1,0 +1,17 @@
+# 给每个 USB 转串口固定一个名字，插拔、重启后 /dev/ttyUSB0/1/2 的顺序变了也不影响
+#
+# 1. 一次只插一个 USB 转串口，执行：
+#      udevadm info -q property -n /dev/ttyUSB0 | grep -E 'ID_PATH=|ID_SERIAL_SHORT='
+# 2. 模块有唯一序列号（CP2102/FT232 一般有）用 ID_SERIAL_SHORT；
+#    CH340 没有序列号，就用 ID_PATH（= 插在树莓派哪个 USB 口），以后每个模块固定插同一个口
+# 3. 把下面的值换成你查到的，然后：
+#      sudo cp 99-robot-serial.rules /etc/udev/rules.d/
+#      sudo udevadm control --reload && sudo udevadm trigger
+#      ls -l /dev/k230 /dev/lift /dev/arm /dev/chassis
+
+SUBSYSTEM=="tty", ENV{ID_PATH}=="platform-xhci-hcd.0-usb-0:1:1.0", SYMLINK+="k230",    MODE="0666"
+SUBSYSTEM=="tty", ENV{ID_PATH}=="platform-xhci-hcd.0-usb-0:2:1.0", SYMLINK+="lift",    MODE="0666"
+SUBSYSTEM=="tty", ENV{ID_PATH}=="platform-xhci-hcd.1-usb-0:1:1.0", SYMLINK+="arm",     MODE="0666"
+SUBSYSTEM=="tty", ENV{ID_PATH}=="platform-xhci-hcd.1-usb-0:2:1.0", SYMLINK+="chassis", MODE="0666"
+
+# 用树莓派自带 UART（GPIO14/15）接某个设备的话，直接在 config.py 里写 /dev/ttyAMA0，不用这里配置

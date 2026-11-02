@@ -1,0 +1,22 @@
+# 不做任何换行符转换：STM32 源码是 GBK 编码 + CRLF，Keil 依赖原样的字节；
+# Python / Markdown 在 Windows 和树莓派之间来回拷，也保持原样最省事。
+* -text
+
+# 这些按文本显示差异（只影响 git diff 的显示，不改文件内容）
+*.c diff
+*.h diff
+*.C diff
+*.s diff
+*.py diff
+*.md diff
+*.json diff
+*.txt diff
+*.sh diff
+*.uvprojx diff
+*.uvproj diff
+*.uvoptx diff
+*.uvopt diff
+
+# 二进制
+*.hex binary
+*.kmodel binary

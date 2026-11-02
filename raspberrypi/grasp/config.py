@@ -1,0 +1,185 @@
+"""
+全部可调参数集中在这里。带 [标定] 的必须按实物测量后修改。
+
+机构：小车底盘 → 升降平台（伺服电机，0~50cm）→ 机械臂 → 相机装在腕部（2 号舵机）上
+      所以相机是"眼在手上"：机械臂换姿态，相机也跟着动。
+      搜索和对准都在固定的 observe（观察）姿态下进行，只转动底座（6 号舵机）。
+
+坐标约定（K230 发来的，单位 mm，都是相对相机）：
+  x  > 0  物块在画面右边
+  y  > 0  物块在画面下边
+  d       物块到相机的距离（深度）
+"""
+
+# ======================= 串口 =======================
+# 树莓派上实测（2026-11-02）：
+#   升降轴 = CH340，插在 USB 口 1.1 → /dev/ttyUSB0
+#   底盘   = WHEELTEC 控制器（WCH 芯片）  → /dev/ttyACM0
+#   机械臂板 = CH340，插在 USB 口 1.3
+#   K230   = 直接接树莓派 GPIO 串口 uart3（K230 GPIO3/TX → 树莓派 GPIO5，GND → 物理脚 30）
+# 用 by-path（按插在哪个 USB 口区分）而不是 ttyUSBx：多个 CH340 同时插时 ttyUSBx 的编号会乱
+PORTS = {
+    "k230":    "/dev/ttyAMA3",   # GPIO5（物理脚 29）= uart3 RX；config.txt 里 dtoverlay=uart3   [重启后确认名字]
+    "lift":    "/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0-port0",
+    "arm":     "/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0-port0",   # 机械臂板 CH340，USB 口 1.3
+    "chassis": "/dev/serial/by-id/usb-WCH.CN_USB_Single_Serial_0002-if00",
+}
+BAUD = {"k230": 115200, "lift": 115200, "arm": 9600, "chassis": 115200}
+
+USE_CHASSIS = True    # 没有底盘（固定工位）就改成 False：深度不再闭环，只靠机械臂伸出姿态插值
+CHASSIS_ACKERMANN = True   # 阿克曼转向（不能原地转，只能边走边转）
+ACK_MIN_RADIUS_MM = 600.0  # [标定] 最小转弯半径；打满方向盘走一圈量一下
+CHASSIS_SPEED_MM_S = 100   # 对准时底盘速度（mm/s），慢一点停得准
+MANUAL_PROCESS = "pad_drive3.py"   # 这个程序在运行 = 手柄接管，自动抓取暂停并让出串口
+
+# ======================= 安全 =======================
+LIFT_MAX_CM = 44.0         # 升降轴软件上限（旧脚本 ourcar.py / pad_drive3.py 都用 44；固件硬上限 50）
+BATTERY_MIN_V = 22.0       # 底盘电池低于这个电压不启动（实测满电约 25.8V）
+
+# K230 相机安装方向：画面坐标转回"x 右、y 下"。
+# K230 板子上的程序（sdcard/main.py，副本在 D:\大车\k230_sdcard\）已经设了 ROTATE_DEG = 90、
+# POSITION_IN_ROTATED_FRAME = True，发出来的 X/Y 已经是正向画面坐标，所以这里保持 0。
+# ✅ 已实测（2026-11-02）：物块右移 X 变大、上移 Y 变小 → 0 正确
+# 注意：K230 在物块碰到画面边缘、或跟踪器在"预测"时不发位置帧，只发心跳（深度=0）
+K230_ROTATE = 0
+
+# ======================= 视觉测量 =======================
+TARGET_TIMEOUT_S = 0.4    # 这么久没有新帧 = 目标丢失
+SETTLE_S = 0.25           # 每个动作完成后等相机画面稳定的时间（相机在机械臂上，晃得更厉害）
+SAMPLE_N = 5              # 每次测量取 N 帧的中位数（抗抖动）
+SAMPLE_N_FAR = 3          # 离目标还远（误差 > 4 倍容差）时只取 3 帧，省时间
+MEASURE_TIMEOUT_S = 1.5   # 收集 N 帧的最长等待
+FOV_X_DEG = 35            # 相机水平半视场角（搜索步距和仿真用）
+FOV_Y_DEG = 25
+K230_FPS = 7              # 实测约 7 帧/秒（--check 时 2 秒 14 帧），只用于仿真
+SIM_MAX_DETECT_MM = 900   # 仿真：超过这个距离认为 24mm 的物块太小、识别不出来
+
+# ======================= 对准目标 =======================
+# [标定] 机械臂在 observe 姿态时，把物块放到"机械臂伸出去刚好能抓到"的位置，
+#        K230 读到的 X、Y、深度填这里（x_deg = atan(X/深度)，单位度）
+GOAL = {"x_deg": 0.0, "y": 0.0, "d": 160.0}
+TOL = {"x_deg": 1.5, "y": 4.0, "d": 10.0}    # 进入这个范围就开始抓
+
+# 每个误差轴由谁来纠正：
+#   j0      初始灵敏度：执行器动 1 个单位，误差变化多少（符号很重要，[标定] 方向）
+#   max/min 单步上下限（min 以下的动作不执行，防止无意义的微动）
+AXES = {
+    # 升降轴上移 1cm → 相机跟着上移 → 物块在画面里下移约 10mm
+    "y":     {"actuator": "lift",        "j0": 10.0, "unit": "cm",  "max": 8.0,   "min": 0.05},
+    # 底座右转 1° → 物块方位角减小约 (1 + R_CAM_MM/深度)°，几何部分程序会自动算，j0 只管方向和偏差
+    "x_deg": {"actuator": "arm_base",    "j0": -1.0, "unit": "deg", "max": 40.0,  "min": 0.3},
+    # 底盘前进 1mm → 深度减小 cos(底座角度) mm
+    "d":     {"actuator": "chassis_fwd", "j0": -1.0, "unit": "mm",  "max": 400.0, "min": 8.0},   # 阿克曼+控制器平滑，走不出更小的步
+}
+R_CAM_MM = 150.0          # [标定] observe 姿态下相机到底座转轴的水平距离（粗略量就行）
+PIVOT_FWD_MM = 80.0       # [粗量] 底座转轴在车转动中心（阿克曼 = 后轴中点）前方多远，几何前馈用
+GEOM_FEEDFORWARD = True   # 底盘边走边转时，按实际里程/转角直接算底座角度（补偿平移视差）
+
+STEP_ALPHA = 0.85         # 每步只走预测量的 85%，宁可多一步也不冲过头
+LEARN_RATE = 0.3          # 自适应灵敏度的学习率
+LEARN_FILE = "learned_gains.json"
+
+MAX_ALIGN_STEPS = 25      # 对准最多走几步，超过算失败
+MAX_ATTEMPTS = 3          # 一个物块最多抓几次
+
+# ======================= 底座 / 底盘配合 =======================
+BASE_US_PER_DEG = 11.1    # [标定] 180° 舵机约 2000us/180°
+BASE_DIR = 1              # [标定] 底座脉宽增大是右转填 1，是左转填 -1
+BASE_LIMIT_DEG = 85.0     # 底座最大转角（以 observe 姿态的底座为 0°）
+BASE_MS_PER_DEG = 6.0     # 底座转动用时（ms/度），太快相机会晃
+# 有底盘时：底座转出去超过这个角度，就让底盘转过去、底座回正（车头对准物块再前进）
+BASE_RECENTER_DEG = 12.0
+
+# ======================= 搜索 =======================
+SEARCH_BASE_DEG = [0, -55, 55, -85, 85]   # 每个高度底座依次转到这些角度看（覆盖约 ±120°）
+SEARCH_CHASSIS_TURNS = [180]     # 仅差速底盘：前方都没看到，原地转这些角度再扫；阿克曼底盘不用
+SEARCH_LIFT_CM = [25, 10, 40]    # 依次在这些高度搜索（中间高度先看，视野覆盖最大）
+# 没有底盘时物块很近：上下视野窄，且相机在转轴外，转底座时视差大，所以高度和角度都扫密一些
+SEARCH_LIFT_CM_NEAR = [25, 15, 35, 5, 45]
+SEARCH_BASE_DEG_NEAR = [0, -30, 30, -60, 60]
+SEARCH_BACKOFF_MM = 250          # 都没找到：底盘后退这么多再搜一遍（物块太近时上下视野太窄会漏掉）
+
+# ======================= 机械臂 =======================
+# Lobot 控制板：id 1 = 爪子，2 = 腕部（相机在这节上），3/4/5 = 臂，6 = 底座；脉宽 500~2500us
+# [标定] 用上位机把机械臂摆到每个姿态，记下 2~5 号舵机的脉宽填进来，然后把 POSES_CALIBRATED 改成 True
+# 底座（6 号）不写在姿态里，由程序控制（对准时转到的角度保持不变）
+#
+# 下面的初值取自树莓派上 ~/arm.txt 里录下的一次真实抓取（Lobot 上位机导出的帧）：
+#   初始 → 张爪 → 伸出(4:714 5:1919) → 合爪(1:1478) → 抬起(5:1275)"抓住"
+#   → 底座转到 2287 → 放下(5:1724) → 松爪 → 回初始
+# 那次只录了一个伸出姿态，所以 reach_near / reach_far 先填成一样的（不插值），标定后再分开
+POSES_CALIBRATED = False
+CLAW_ID = 1
+BASE_ID = 6
+BASE_CENTER = 1500        # [标定] 底座朝正前方时的脉宽（arm.txt 里初始姿态是 1500）
+CLAW_OPEN = 500           # arm.txt：张爪 500
+CLAW_CLOSE = 1478         # arm.txt：合爪 1478（"抓住"）
+POSES = {
+    "observe":    {2: 1500, 3: 758, 4: 601, 5: 1185},   # [确认] arm.txt 的初始姿态；要确认这个姿态下相机能平视前方
+    "ready":      {2: 1500, 3: 758, 4: 601, 5: 1185},   # 伸出前的过渡姿态（arm.txt 里没有，先和 observe 一样）
+    "reach_near": {2: 1500, 3: 758, 4: 714, 5: 1919},   # arm.txt：伸出
+    "reach_far":  {2: 1500, 3: 758, 4: 714, 5: 1919},
+    "carry":      {2: 1500, 3: 758, 4: 714, 5: 1275},   # arm.txt：抬起
+    "drop":       {2: 1500, 3: 758, 4: 714, 5: 1724, 6: 2287},   # arm.txt：转到 2287 放下
+}
+REACH_NEAR_D = 130.0      # [标定] 两个 reach 姿态各自对应的物块深度（observe 姿态下测的，mm）
+REACH_FAR_D = 200.0
+REACH_RANGE_OK = True     # 深度超出这个范围时仍尝试（姿态截断到边界）
+ARM_MOVE_MS = 1000        # 一般动作时间（arm.txt 里每帧都是 1000ms）
+ARM_SLOW_MS = 1200        # 伸向物块时放慢
+LIFT_AFTER_GRASP_CM = 5.0 # 合爪后升降轴上抬多少
+
+# 抓取后判断是否成功：
+#   "lift_check"  合爪后抬升：物块跟着相机一起上去（画面里 y 基本不变）= 抓到；
+#                 物块留在原地（y 明显变大或看不见了）= 没抓到。伸出后物块离相机太近看不到时判断不了，按成功处理
+#   "auto"        先做 lift_check；判断不了时再做"观察确认"：爪子闭合退回观察姿态、升降轴降回原高度，
+#                 原位置还能看到物块 = 没抓到（多花 3~4 秒，但不会把没抓到当成功）
+#   "none"        不判断
+VERIFY = "auto"
+VERIFY_DY_MM = 15.0       # 抬升后 y 变化小于这个值算抓到
+VERIFY_SAME_D_MM = 40.0   # 观察确认：深度和 GOAL 相差小于这个值，算"物块还在原位置"
+
+# ======================= 评分（只用于记录和比较参数，不参与控制） =======================
+# score = 100*成功 - 每步 2 分 - 最终误差/容差*5 - 用时(s)*0.5
+SCORE_STEP_COST = 2.0
+SCORE_ERR_COST = 5.0
+SCORE_TIME_COST = 0.5
+
+LOG_DIR = "logs"
+
+# ======================= 标定结果覆盖 =======================
+# calib.py 把标定结果写进同目录的 calib.json，这里自动加载并覆盖上面的默认值——不用手改本文件。
+# 想恢复默认：删掉 calib.json（或里面的某一项）即可。
+import json as _json
+import os as _os
+
+CALIB_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "calib.json")
+CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
+    "GOAL", "TOL", "R_CAM_MM", "BASE_DIR", "BASE_CENTER", "BASE_US_PER_DEG", "CLAW_OPEN", "CLAW_CLOSE",
+    "REACH_NEAR_D", "REACH_FAR_D", "POSES_CALIBRATED", "ACK_MIN_RADIUS_MM", "K230_ROTATE", "LIFT_MAX_CM",
+    "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
+    "ARM_SLOW_MS", "STEP_ALPHA",
+}
+
+
+def _apply_calib():
+    g = globals()
+    try:
+        with open(CALIB_FILE, encoding="utf-8") as f:
+            data = _json.load(f)
+    except (OSError, ValueError):
+        return {}
+    for k, v in data.items():
+        if k == "POSES":            # 只覆盖写了的姿态
+            for name, pose in v.items():
+                g["POSES"][name] = {int(a): int(b) for a, b in pose.items()} if pose else None
+        elif k == "AXES_J0":        # 只覆盖灵敏度初值
+            for ax, j in v.items():
+                if ax in g["AXES"]:
+                    g["AXES"][ax]["j0"] = float(j)
+        elif k in CALIB_KEYS:
+            g[k] = v
+    return data
+
+
+CALIB_LOADED = _apply_calib()

@@ -1,0 +1,382 @@
+"""
+全自动抓取的任务流程（状态机），按"眼在手上"设计：相机装在机械臂腕部
+
+  观察姿态 → 搜索 → 对准（闭环，自适应）→ 抓取 → 抬升确认 → 放置
+                ↑__________ 丢失目标 / 抓取失败（最多 MAX_ATTEMPTS 次）
+
+对准时机械臂保持 observe 姿态，只动三样东西：
+  y      升降轴（整条机械臂连相机一起上下）
+  x_deg  机械臂底座（相机跟着转）；底座转出去太多时，底盘转过去、底座回正
+  d      底盘前进 / 后退
+"""
+import csv
+import math
+import os
+
+from devices import DeviceError, ManualOverride, lerp_pose
+from servo import build_axes, save_axes
+
+
+class GraspTask:
+    def __init__(self, cfg, clock, cam, lift, arm, chassis, log_dir=None, learn=True, verbose=True,
+                 guard=None):
+        self.cfg = cfg
+        self.guard = guard            # 手柄接管检测（ManualGuard），None = 不检测
+        self.can_turn = cfg.USE_CHASSIS and not cfg.CHASSIS_ACKERMANN   # 能不能原地转
+        self.clock = clock
+        self.cam = cam
+        self.lift = lift
+        self.arm = arm
+        self.chassis = chassis
+        self.verbose = verbose
+        self.learn = learn
+        self.axis_names = ["y", "x_deg", "d"] if cfg.USE_CHASSIS else ["y", "x_deg"]
+        self.learn_path = os.path.join(log_dir, cfg.LEARN_FILE) if log_dir else None
+        self.axes = build_axes(cfg, self.axis_names, self.learn_path if learn else None)
+        self.log_dir = log_dir
+        self.episode = 0
+        self.base_deg = 0.0
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+    # ------------------------------------------------ 工具
+    def say(self, *a):
+        if self.verbose:
+            print(f"[{self.clock.now():8.2f}]", *a)
+
+    def measure(self, n=None):
+        """等画面稳定后测量一次（每一步都会经过这里，顺便检查有没有被手柄接管）"""
+        if self.guard is not None and self.guard.active:
+            raise ManualOverride("手柄已连接，自动抓取暂停")
+        self.clock.sleep(self.cfg.SETTLE_S)
+        m = self.cam.measure(self.clock.now(), n or self.cfg.SAMPLE_N, self.cfg.MEASURE_TIMEOUT_S)
+        # 连心跳都没有 = 串口线断了 / K230 程序停了：不能当成"没看到物块"继续开车乱找
+        link_ok = getattr(self.cam, "link_ok", None)
+        if m is None and link_ok is not None and not link_ok(2.0):
+            raise DeviceError("K230 没有任何数据（连心跳都没有）：检查 K230 串口线和程序")
+        return m
+
+    def in_tol(self, e):
+        return all(abs(e[n]) <= self.cfg.TOL[n] for n in self.axis_names)
+
+    def _append_csv(self, name, row):
+        if not self.log_dir:
+            return
+        path = os.path.join(self.log_dir, name)
+        new = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if new:
+                w.writeheader()
+            w.writerow(row)
+
+    # ------------------------------------------------ 机械臂
+    def base_pulse(self, deg=None):
+        c = self.cfg
+        deg = self.base_deg if deg is None else deg
+        return int(round(c.BASE_CENTER + c.BASE_DIR * deg * c.BASE_US_PER_DEG))
+
+    def set_base(self, deg):
+        c = self.cfg
+        deg = max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, deg))
+        ms = int(max(150, abs(deg - self.base_deg) * c.BASE_MS_PER_DEG))
+        self.arm.move({c.BASE_ID: self.base_pulse(deg)}, ms)
+        self.base_deg = deg
+        return deg
+
+    def base_after_move(self, m, base_deg, s_mm, dpsi_right_deg):
+        """
+        几何前馈：车走了 s_mm、车头右转 dpsi_right_deg 之后，底座要转到多少度，相机才正对物块。
+        坐标（车体系）：x 向前、y 向左；底座转轴在车的转动中心前方 PIVOT_FWD_MM，
+        相机在转轴外 R_CAM_MM，朝向沿半径向外（底座右转 = 朝向角减小）。
+        """
+        c = self.cfg
+        R, pv = c.R_CAM_MM, c.PIVOT_FWD_MM
+        phi = -math.radians(base_deg)
+        ux, uy = math.cos(phi), math.sin(phi)            # 相机朝向
+        cx, cy = pv + R * ux, R * uy                     # 相机位置
+        tx = cx + m.d * ux + m.x * uy                    # 物块位置 = 相机 + 深度·朝向 − x右·左方向
+        ty = cy + m.d * uy - m.x * ux
+        psi = -math.radians(dpsi_right_deg)              # 车头左转为正
+        px, py = s_mm * math.cos(psi / 2), s_mm * math.sin(psi / 2)   # 沿圆弧走：近似按弧中点朝向
+        dx, dy = tx - px, ty - py
+        qx = dx * math.cos(psi) + dy * math.sin(psi) - pv               # 物块在新车体系里、相对底座转轴
+        qy = -dx * math.sin(psi) + dy * math.cos(psi)
+        dist = math.hypot(qx, qy)
+        # 让物块出现在 GOAL 的方位角上：迭代修正（相机在半径上，偏 1° 方位角 ≈ 1 + R/深度 度）
+        want = -math.radians(c.GOAL["x_deg"])            # 左为正
+        ph = math.atan2(qy, qx)
+        for _ in range(5):
+            ex, ey = qx - R * math.cos(ph), qy - R * math.sin(ph)
+            bearing = math.atan2(-ex * math.sin(ph) + ey * math.cos(ph), ex * math.cos(ph) + ey * math.sin(ph))
+            ph -= (bearing - want) / -(1.0 + R / max(dist - R, 50.0))
+        return -math.degrees(ph)
+
+    def go_observe(self, base_deg=None):
+        c = self.cfg
+        if base_deg is not None:
+            self.base_deg = max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, base_deg))
+        self.arm.move({**c.POSES["observe"], c.BASE_ID: self.base_pulse(), c.CLAW_ID: c.CLAW_OPEN},
+                      c.ARM_MOVE_MS)
+
+    # ------------------------------------------------ 搜索
+    def search(self):
+        """
+        每个高度：先只转底座扫前方（最快）→ 底盘掉头扫后方（仅差速底盘）；没找到再换高度
+        """
+        c = self.cfg
+        turns = [0] + (list(c.SEARCH_CHASSIS_TURNS) if self.can_turn else [])
+        bases = list(c.SEARCH_BASE_DEG if c.USE_CHASSIS else c.SEARCH_BASE_DEG_NEAR)
+        heights = c.SEARCH_LIFT_CM if c.USE_CHASSIS else c.SEARCH_LIFT_CM_NEAR
+        rounds = 2 if (c.USE_CHASSIS and c.SEARCH_BACKOFF_MM) else 1
+        turned = 0.0
+        for r in range(rounds):
+            if r:
+                self.say(f"搜索：没找到，后退 {c.SEARCH_BACKOFF_MM}mm 再搜")
+                self.set_base(0)
+                back = (turned + 180.0) % 360.0 - 180.0      # 转回原方向，走最短的一边
+                if abs(back) > 1 and self.can_turn:
+                    self.chassis.turn(-back)
+                turned = 0.0
+                self.chassis.forward(-c.SEARCH_BACKOFF_MM)
+            for h in heights:
+                self.lift.move_to(h)
+                for t in turns:
+                    if t:
+                        self.set_base(0)
+                        self.chassis.turn(t)
+                        turned += t
+                    for b in bases:
+                        self.set_base(b)
+                        m = self.measure()
+                        if m:
+                            self.say(f"搜索：找到目标（高度 {h}cm，底座 {b:+.0f}°）")
+                            return m
+                    bases.reverse()          # 下一轮反向扫，少转一大圈
+        return None
+
+    # ------------------------------------------------ 对准
+    def align(self, m):
+        """闭环对准。返回 (是否对准, 最后一次测量, 用了几步)"""
+        c = self.cfg
+        for step in range(c.MAX_ALIGN_STEPS):
+            if m is None:
+                self.say("对准：目标丢失")
+                return False, None, step
+            e = m.err(c.GOAL)
+            if self.in_tol(e):
+                return True, m, step
+
+            # 已知的几何系数：底座转动时相机绕转轴走一段弧，偏角变化比转角大
+            s_x = 1.0 + c.R_CAM_MM / max(m.d, 50.0)
+            s_d = max(0.2, math.cos(math.radians(self.base_deg)))
+            u_y = self.axes["y"].command(e["y"]) if abs(e["y"]) > c.TOL["y"] else 0.0
+            u_x = self.axes["x_deg"].command(e["x_deg"], s_x) if abs(e["x_deg"]) > c.TOL["x_deg"] else 0.0
+            u_d = 0.0
+            if c.USE_CHASSIS and abs(e["d"]) > c.TOL["d"]:
+                u_d = self.axes["d"].command(e["d"], s_d)
+
+            base_old = self.base_deg
+            base_new = max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, base_old + u_x))
+            u_x = base_new - base_old
+            recenter = c.USE_CHASSIS and abs(base_new) > c.BASE_RECENTER_DEG
+            if self.can_turn:
+                # 差速底盘：底座偏得多就原地转过去、底座回正；偏的时候不前进（否则斜着走）
+                if recenter or abs(e["x_deg"]) > 10:
+                    u_d = 0.0
+            else:
+                # 阿克曼底盘：不能原地转，只能在前进的同时把车头往底座的方向拐（见下面 drive）
+                recenter = recenter and bool(u_d)
+
+            if not (u_y or u_x or u_d or recenter):
+                return True, m, step       # 剩下的误差小于最小动作，没法更好了
+
+            self.say("对准 #%d  误差 x=%+.1f° y=%+.1fmm d=%+.0fmm  底座 %+.1f° → %s" % (
+                step + 1, e["x_deg"], e["y"], e.get("d", 0.0), base_old,
+                " ".join(s for s in [
+                    f"升降{u_y:+.2f}cm" if u_y else "",
+                    f"底座{u_x:+.1f}°" if u_x else "",
+                    f"前进{u_d:+.0f}mm" if u_d else "",
+                    f"车头往底座方向拐" if recenter else ""] if s)))
+
+            # 执行：升降轴和底盘 / 底座同时动
+            if u_y:
+                self.lift.start_move_by(u_y)
+            if recenter and self.can_turn:
+                self.chassis.turn(base_new)
+                self.set_base(0)
+            elif u_d:
+                # 边走边转；走完按实际里程 + 转角做几何前馈，直接算出底座该转到哪（含平移视差）
+                moved, dpsi = self.chassis.drive(u_d, base_new if recenter else 0.0)
+                if c.GEOM_FEEDFORWARD:
+                    target = self.base_after_move(m, base_old, moved, dpsi)
+                    target = max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, target))
+                else:
+                    target = base_new - dpsi
+                self.set_base(target)
+                u_x = target - base_old
+                recenter = abs(dpsi) > 0.5
+            elif u_x:
+                self.set_base(base_new)
+            if u_y:
+                self.lift.wait_move()
+
+            # 离目标还远时少取几帧（快），快对准了再取足帧数（准）
+            far = any(abs(e[k]) > 4 * c.TOL[k] for k in self.axis_names)
+            m2 = self.measure(c.SAMPLE_N_FAR if far else None)
+
+            if m2 is not None and self.learn:
+                e2 = m2.err(c.GOAL)
+                # 只学习没有被别的动作干扰的轴
+                if u_y:
+                    self.axes["y"].learn(u_y, e["y"], e2["y"])
+                if u_x and not recenter and not u_d:
+                    self.axes["x_deg"].learn(u_x, e["x_deg"], e2["x_deg"], s_x)
+                if u_d and not u_x and not recenter:
+                    self.axes["d"].learn(u_d, e["d"], e2["d"], s_d)
+
+            self._append_csv("steps.csv", {
+                "episode": self.episode, "step": step + 1, "base_deg": round(base_old, 1),
+                **{f"e_{n}": round(e[n], 2) for n in self.axis_names},
+                "u_y": round(u_y, 3), "u_x": round(u_x, 2), "u_d": round(u_d, 1), "recenter": int(recenter),
+                **{f"J_{n}": round(self.axes[n].j, 4) for n in self.axis_names}})
+            m = m2
+        return False, m, c.MAX_ALIGN_STEPS
+
+    # ------------------------------------------------ 抓取
+    def grasp(self, m):
+        """伸出 → 合爪 → 抬升；返回是否确认抓到"""
+        c = self.cfg
+        t = (m.d - c.REACH_NEAR_D) / (c.REACH_FAR_D - c.REACH_NEAR_D)
+        if not 0 <= t <= 1 and not c.REACH_RANGE_OK:
+            raise DeviceError(f"物块深度 {m.d:.0f}mm 超出机械臂范围")
+        reach = lerp_pose(c.POSES["reach_near"], c.POSES["reach_far"], t)
+        bp = self.base_pulse()
+
+        self.say(f"抓取：深度 {m.d:.0f}mm，插值 t={max(0.0, min(1.0, t)):.2f}，底座 {self.base_deg:+.1f}°")
+        self.arm.move({c.CLAW_ID: c.CLAW_OPEN}, 300)
+        self.arm.move({**c.POSES["ready"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
+        self.arm.move({**reach, c.BASE_ID: bp}, c.ARM_SLOW_MS)
+        self.arm.move({c.CLAW_ID: c.CLAW_CLOSE}, 500)
+
+        verify = c.VERIFY
+        m_before = self.measure() if verify in ("lift_check", "auto") else None
+        self.lift.move_by(c.LIFT_AFTER_GRASP_CM)
+        self._lifted = True
+        m_after = self.measure() if verify in ("lift_check", "auto") else None
+        self.arm.move({**c.POSES["carry"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
+
+        if verify == "none":
+            return True
+        ok = self._lift_check(m_before, m_after)
+        if ok is None and verify == "auto":
+            ok = self._observe_check(bp)
+        if ok is None:
+            self.say("确认：无法判断，按成功处理")
+            return True
+        return ok
+
+    def _lift_check(self, m_before, m_after):
+        """抬升确认：抓到了物块跟着相机走（y 不变）；没抓到物块留在原地（y 变大或看不见）。None = 判断不了"""
+        c = self.cfg
+        if m_before is None:
+            self.say("抬升确认：伸出后看不到物块（离得太近、碰到画面边缘），判断不了")
+            return None
+        if m_after is None:
+            self.say("抬升确认：抬起后物块不见了（留在原地）→ 没抓到")
+            return False
+        dy = m_after.y - m_before.y
+        ok = abs(dy) < c.VERIFY_DY_MM
+        self.say(f"抬升确认：抬升后物块在画面里移动 {dy:+.1f}mm → {'抓到' if ok else '没抓到'}")
+        return ok
+
+    def _observe_check(self, bp):
+        """
+        观察确认：爪子保持闭合，退回观察姿态、升降轴降回抓取时的高度，看原来的位置还有没有物块。
+        还在（和 GOAL 差不多的位置）= 没抓到；不在 = 抓到了。
+        """
+        c, g = self.cfg, self.cfg.GOAL
+        self.arm.move({**c.POSES["observe"], c.BASE_ID: bp}, c.ARM_MOVE_MS)     # 爪子不动
+        self.lift.move_by(-c.LIFT_AFTER_GRASP_CM)
+        self._lifted = False
+        m = self.measure()
+        still = (m is not None and abs(m.d - g["d"]) < c.VERIFY_SAME_D_MM
+                 and abs(m.x_deg - g["x_deg"]) < 6 and abs(m.y - g["y"]) < 30)
+        self.say("观察确认：" + ("原位置还能看到物块 → 没抓到" if still else "原位置没有物块了 → 抓到"))
+        if not still:                       # 抓到了：重新抬起、收回，准备放置
+            self.lift.move_by(c.LIFT_AFTER_GRASP_CM)
+            self._lifted = True
+            self.arm.move({**c.POSES["carry"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
+        return not still
+
+    def _lower_back(self):
+        """升降轴回到抓取前的高度（只在抬起过时）"""
+        if getattr(self, "_lifted", False):
+            self.lift.move_by(-self.cfg.LIFT_AFTER_GRASP_CM)
+            self._lifted = False
+
+    def place(self):
+        c = self.cfg
+        drop = c.POSES.get("drop")
+        if drop:
+            self.arm.move({c.BASE_ID: self.base_pulse(), **drop}, c.ARM_MOVE_MS)
+            self.arm.move({c.CLAW_ID: c.CLAW_OPEN}, 400)
+        self.go_observe(0)
+        self._lower_back()
+
+    def release_and_back_off(self):
+        c = self.cfg
+        self.arm.move({c.CLAW_ID: c.CLAW_OPEN}, 400)
+        self.go_observe()
+        self._lower_back()
+        if c.USE_CHASSIS:
+            self.chassis.forward(-60)        # 退一点再重新看
+
+    # ------------------------------------------------ 一次完整抓取
+    def run_once(self):
+        c = self.cfg
+        self.episode += 1
+        t0 = self.clock.now()
+        steps = 0
+        attempts = 0
+        result = "not_found"
+        last_err = None
+
+        self.go_observe(0)
+        m = self.search()
+        while m is not None and attempts < c.MAX_ATTEMPTS:
+            attempts += 1
+            ok, m_al, n = self.align(m)
+            steps += n
+            if m_al is not None:
+                last_err = m_al.err(c.GOAL)
+            if not ok:
+                result = "lost" if m_al is None else "align_failed"
+                self.go_observe()
+                m = self.search()
+                continue
+            steps += 1
+            if self.grasp(m_al):
+                result = "success"
+                self.place()
+                break
+            result = "grasp_failed"
+            self.say("抓取失败，松开、退后重试")
+            self.release_and_back_off()
+            m = self.measure() or self.search()
+
+        dt = self.clock.now() - t0
+        err_norm = 0.0
+        if last_err:
+            err_norm = sum(abs(last_err[n]) / c.TOL[n] for n in self.axis_names) / len(self.axis_names)
+        score = (100.0 if result == "success" else 0.0) - c.SCORE_STEP_COST * steps \
+            - c.SCORE_ERR_COST * err_norm - c.SCORE_TIME_COST * dt
+
+        if self.learn and self.learn_path:
+            save_axes(self.axes, self.learn_path)
+        row = {"episode": self.episode, "result": result, "attempts": attempts, "steps": steps,
+               "time_s": round(dt, 1), "err_norm": round(err_norm, 2), "score": round(score, 1),
+               **{f"J_{n}": round(a.j, 4) for n, a in self.axes.items()}}
+        self._append_csv("episodes.csv", row)
+        self.say(f"结果：{result}  步数 {steps}  用时 {dt:.1f}s  评分 {score:.1f}")
+        return row

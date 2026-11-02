@@ -1,0 +1,20 @@
+# 开机自动运行抓取程序，崩溃后 3 秒自动重启
+#   sudo cp grasp.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now grasp      # 开机自启并立即启动
+#   journalctl -u grasp -f                 # 看实时日志
+#   sudo systemctl stop grasp              # 调试时先停掉，否则串口被占用
+[Unit]
+Description=Auto grasp controller
+After=multi-user.target
+
+[Service]
+User=ycy
+WorkingDirectory=/home/ycy/grasp
+ExecStart=/usr/bin/python3 main.py
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
