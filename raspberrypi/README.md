@@ -78,6 +78,7 @@ K230 ──串口──►                ┌──► 升降轴 STM32（伺服�
 | `grasp/selftest.py` | 离线自测：假下位机测所有驱动（底盘按固件源码复现）+ 几何前馈 + 仿真回归 + bench.py。改完代码先跑它 |
 | `grasp/chassis_test.py` | 底盘停车精度真机测试：走 ±100mm 各 3 次打印误差、航向漂移（`--model`、`--ruler`、`--timeout-check`），见 `docs/cloud_tasks/results/03_报告.md` |
 | `grasp/bench.py` | **真机试验记录**：按测试矩阵（近/中/远 × 左/中/右）提示放物块 → 自动抓 → 问你真的抓到没有、偏哪边 → 记到 `logs/bench.csv`；`bench.py report` 按位置统计并给出调参建议 |
+| `grasp/recorder.py` | **论文数据记录**：`main.py --record` 时记录每条动作命令和 K230 每一帧；`recorder.py backlash/pairs` 离线分析回差、抽样本对。测试 `test_recorder.py` |
 | `grasp/report.py` | 看日志：成功率、步数趋势、某次抓取的逐步误差/动作，并给出诊断提示 |
 | `grasp/task.py` | 任务流程：搜索 → 对准 → 抓取 → 确认 → 放置 |
 | `grasp/servo.py` | 自适应视觉伺服 |
@@ -152,6 +153,18 @@ python3 bench.py --sim           # 不接硬件先练习一遍（记到 logs/ben
 - 物块放在离车 **90cm 以内**：24mm 的物块再远 K230 识别不出来（仿真里"没找到"的全是这种情况）
 - `PIVOT_FWD_MM`（底座转轴到后轴中点的前后距离）粗量一下即可，估错 50mm 仿真里也没问题
 - 第一次加底盘时，后退搜索（`SEARCH_BACKOFF_MM = 250`）是倒车、看不到后面，车后要留空
+
+## 记录论文数据（只记录，不改动作）
+```bash
+python3 main.py --once --no-chassis --record     # 动作命令 + K230 每一帧 → logs/record_*.jsonl
+GRASP_RECORD=1 python3 bench.py                  # bench 测试的同时记录
+python3 recorder.py summary logs/record_*.jsonl  # 记了什么
+python3 recorder.py backlash logs/record_*.jsonl # 底座回差/死区：同向 vs 反向、小角度 vs 大角度的"画面变化 / 命令角"
+python3 recorder.py pairs logs/record_*.jsonl > pairs.csv   # 动作 → 画面响应样本对
+python3 test_recorder.py                          # 离线测试
+```
+- 建议从现在起每次真机运行都加 `--record`：调试、比赛训练都在积累数据集（见 `docs/论文研究方案.md`）
+- 文件约每分钟几百 KB；`logs/` 不在仓库里，定期拷到电脑上
 
 ## 其他用法
 ```bash

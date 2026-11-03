@@ -267,18 +267,48 @@ def run_check():
 
 
 # ============================================================ 真机运行
-def attach_task(task, devs, clock, step=False, guard=None):
+_RECORDER = None
+
+
+def get_recorder(clock, cam, enable=False):
+    """--record 或环境变量 GRASP_RECORD=1 时返回记录器（整个进程共用一个文件）；否则 None"""
+    global _RECORDER
+    if not (enable or os.environ.get("GRASP_RECORD") == "1"):
+        return None
+    if _RECORDER is None:
+        import atexit
+        from recorder import Recorder
+        path = os.path.join(LOG_DIR, time.strftime("record_%Y%m%d_%H%M%S.jsonl"))
+        _RECORDER = Recorder(path, clock, cam)
+        _RECORDER.write("calib", keys=sorted(getattr(cfg, "CALIB_LOADED", [])))
+        atexit.register(_RECORDER.close)
+        print("记录动作和 K230 数据到", path)
+    else:
+        _RECORDER.set_cam(cam)
+    return _RECORDER
+
+
+def attach_task(task, devs, clock, step=False, guard=None, record=False):
     """把（重新）打开的设备装到抓取任务上；task 为 None 时新建（bench.py 也用）"""
     cam, lift, arm, chassis = devs
+    rec = get_recorder(clock, cam, record)
+    if rec is not None:                  # 记录在里层：单步模式下按了回车、真的执行了才记
+        from recorder import RecordProxy
+        lift, arm, chassis = (RecordProxy(lift, "lift", rec), RecordProxy(arm, "arm", rec),
+                              RecordProxy(chassis, "chassis", rec))
     if step:
         lift, arm, chassis = (StepProxy(lift, "升降轴"), StepProxy(arm, "机械臂"), StepProxy(chassis, "底盘"))
     if task is None:
-        return GraspTask(cfg, clock, cam, lift, arm, chassis, log_dir=LOG_DIR, guard=guard)
-    task.cam, task.lift, task.arm, task.chassis = cam, lift, arm, chassis
+        task = GraspTask(cfg, clock, cam, lift, arm, chassis, log_dir=LOG_DIR, guard=guard)
+    else:
+        task.cam, task.lift, task.arm, task.chassis = cam, lift, arm, chassis
+    if rec is not None:
+        from recorder import hook_task
+        hook_task(task, rec)
     return task
 
 
-def run_real(once, step, force):
+def run_real(once, step, force, record=False):
     clock = RealClock()
     guard = ManualGuard(cfg.MANUAL_PROCESS)
     time.sleep(1.2)
@@ -302,7 +332,7 @@ def run_real(once, step, force):
                     if problems and not force:
                         print(f"有 {len(problems)} 项检查没通过，不启动（确认安全的话可以加 --force 跳过）")
                         return
-                task = attach_task(task, devs, clock, step, guard)
+                task = attach_task(task, devs, clock, step, guard, record)
             try:
                 r = task.run_once()
             except ManualOverride as e:
@@ -337,6 +367,8 @@ if __name__ == "__main__":
     ap.add_argument("--no-chassis", action="store_true", help="不用底盘（固定工位，或者先只调机械臂和升降轴）")
     ap.add_argument("--force", action="store_true", help="启动前检查没通过也继续（自己确认安全）")
     ap.add_argument("--check", action="store_true", help="只读自检：看各串口和下位机是否正常，不动任何东西")
+    ap.add_argument("--record", action="store_true",
+                    help="记录每条动作命令和 K230 每一帧到 logs/record_*.jsonl（论文数据；只记录，不改动作）")
     a = ap.parse_args()
     if a.check:
         run_check()
@@ -347,4 +379,4 @@ if __name__ == "__main__":
             cfg.USE_CHASSIS = False
         sys.stdout = Tee(os.path.join(LOG_DIR, time.strftime("run_%Y%m%d_%H%M%S.log")))
         print("启动：", " ".join(sys.argv), " calib.json 覆盖：", sorted(cfg.CALIB_LOADED))
-        run_real(a.once, a.step, a.force)
+        run_real(a.once, a.step, a.force, a.record)
