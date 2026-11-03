@@ -449,6 +449,10 @@ class WheeltecChassis:
             while True:
                 el = self._now() - t0
                 if fb:
+                    if not self.has_feedback():
+                        # 走到一半回传断了：里程不再增加，原来会一直开到超时（400mm 的一步要 23 秒）。
+                        # 先停车再报错（finally 里发 0）
+                        raise DeviceError("底盘回传中断（走到一半收不到回传帧），已停车：检查 USB 线 / 底盘电源")
                     with self._lock:
                         done = abs(self.dist - d0)
                         v_act = abs(self.fb_vx)

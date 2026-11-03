@@ -17,6 +17,7 @@
 """
 import argparse
 import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -102,6 +103,21 @@ def run_sim(n, seed, learn, no_chassis=False):
 
 
 # ============================================================ 真机设备
+def install_stop_signals():
+    """
+    任务 18：SIGTERM（systemctl stop grasp、kill）和 SIGHUP（SSH 断开）默认会让 Python 直接退出，
+    finally 和 atexit 都不执行，底盘停车帧发不出去 —— 固件没有串口超时，车会按最后的速度一直走。
+    改成和 Ctrl+C 一样抛 KeyboardInterrupt，走正常的停车 / 关设备流程。kill -9 和断电仍然拦不住。
+    """
+    def stop(signum, frame):
+        raise KeyboardInterrupt(f"收到信号 {signal.Signals(signum).name}")
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, stop)
+
+
 def chassis_options(c):
     """config.py 里底盘驱动的可调参数（chassis_test.py 也用）"""
     return dict(stop_model=c.CHASSIS_STOP_MODEL, cmd_latency_s=c.CHASSIS_CMD_LATENCY_S,
@@ -379,4 +395,5 @@ if __name__ == "__main__":
             cfg.USE_CHASSIS = False
         sys.stdout = Tee(os.path.join(LOG_DIR, time.strftime("run_%Y%m%d_%H%M%S.log")))
         print("启动：", " ".join(sys.argv), " calib.json 覆盖：", sorted(cfg.CALIB_LOADED))
+        install_stop_signals()
         run_real(a.once, a.step, a.force, a.record)
