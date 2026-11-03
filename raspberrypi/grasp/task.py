@@ -10,6 +10,7 @@
   d      底盘前进 / 后退
 """
 import csv
+import json
 import math
 import os
 import time
@@ -39,6 +40,13 @@ class GraspTask:
         self.base_deg = 0.0
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
+        # 任务 09：底座消回差要记住最后一次发给底座的脉宽和转动方向（None / 0 = 不知道）
+        self._base_sent = None
+        self._base_dir = 0
+        self.backlash_moves = 0          # 统计：为消回差多转了几次
+        self._probe_mm = 0.0             # 这次伸出的左右试探量（mm，偏右为正）
+        self.trim_path = os.path.join(log_dir, cfg.TRIM_LEARN_FILE) if log_dir else None
+        self.trim_state = self._load_trim() if cfg.TRIM_LEARN else None
 
     # ------------------------------------------------ 工具
     def say(self, *a):
@@ -89,9 +97,39 @@ class GraspTask:
         c = self.cfg
         deg = max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, deg))
         ms = int(max(150, abs(deg - self.base_deg) * c.BASE_MS_PER_DEG))
-        self.arm.move({c.BASE_ID: self.base_pulse(deg)}, ms)
+        self._arm({c.BASE_ID: self.base_pulse(deg)}, ms)
         self.base_deg = deg
         return deg
+
+    def _arm(self, pulses, ms, precise=True):
+        """
+        发机械臂指令。带底座（6 号）时记下脉宽和转动方向；打开 BASE_BACKLASH_DEG 后，
+        precise 的动作如果最后一段不是从 BASE_APPROACH_DIR 那边过来的，先多转 BASE_BACKLASH_DEG 再转回来。
+        BASE_BACKLASH_DEG = 0 时和直接 self.arm.move 完全一样。
+        """
+        c = self.cfg
+        p = pulses.get(c.BASE_ID)
+        if p is None:
+            self.arm.move(pulses, ms)
+            return
+        p = int(round(p))
+        a = c.BASE_APPROACH_DIR * c.BASE_DIR          # 逼近方向（脉宽增大 = +1）
+        prev = self._base_sent
+        move = 0 if prev is None else (p > prev) - (p < prev)
+        bl = c.BASE_BACKLASH_DEG
+        if precise and bl > 0 and not (move == a or (move == 0 and self._base_dir == a)):
+            over = int(round(p - a * bl * c.BASE_US_PER_DEG))      # 先转过头（逼近方向的反方向）
+            dist = abs(over - (prev if prev is not None else p)) / c.BASE_US_PER_DEG
+            self.arm.move({c.BASE_ID: over}, int(max(150, ms if len(pulses) == 1 else 0,
+                                                     dist * c.BASE_MS_PER_DEG)))
+            self.backlash_moves += 1
+            move = a
+            if len(pulses) == 1:              # 只动底座：大段已经走完，回来只有 BASE_BACKLASH_DEG 这么远
+                ms = int(max(150, bl * c.BASE_MS_PER_DEG))
+        self.arm.move(pulses, ms)
+        if move:
+            self._base_dir = move
+        self._base_sent = p
 
     def base_after_move(self, m, base_deg, s_mm, dpsi_right_deg):
         """
@@ -125,8 +163,8 @@ class GraspTask:
         c = self.cfg
         if base_deg is not None:
             self.base_deg = max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, base_deg))
-        self.arm.move({**c.POSES["observe"], c.BASE_ID: self.base_pulse(), c.CLAW_ID: c.observe_claw()},
-                      c.ARM_MOVE_MS)
+        self._arm({**c.POSES["observe"], c.BASE_ID: self.base_pulse(), c.CLAW_ID: c.observe_claw()},
+                  c.ARM_MOVE_MS)
 
     # ------------------------------------------------ 搜索
     def search(self):
@@ -222,6 +260,8 @@ class GraspTask:
             s_d = max(0.2, math.cos(math.radians(self.base_deg)))
             u_y = self.axes["y"].command(e["y"]) if abs(e["y"]) > c.TOL["y"] else 0.0
             u_x = self.axes["x_deg"].command(e["x_deg"], s_x) if abs(e["x_deg"]) > c.TOL["x_deg"] else 0.0
+            if c.BASE_MIN_STEP_DEG > 0 and abs(e["x_deg"]) > c.TOL["x_deg"]:
+                u_x = self._min_base_step(u_x, e["x_deg"], s_x)
             u_d = 0.0
             if c.USE_CHASSIS and abs(e["d"]) > c.TOL["d"]:
                 u_d = self.axes["d"].command(e["d"], s_d)
@@ -327,29 +367,151 @@ class GraspTask:
             m = m2
         return False, m, c.MAX_ALIGN_STEPS
 
+    def _min_base_step(self, u_x, ex, s_x):
+        """
+        底座最小有效步长（BASE_MIN_STEP_DEG）：小角度指令会被舵机死区 / 回差吃掉，步子太小就放大到这个值；
+        但最多放大到"预测误差 = 反方向 0.9 倍容差"，不会冲出容差另一边造成来回摆
+        """
+        c = self.cfg
+        g = abs(self.axes["x_deg"].j * s_x)                    # 底座转 1°，方位角变多少度
+        sign = -1.0 if ex * self.axes["x_deg"].j * s_x > 0 else 1.0
+        cap = (abs(ex) + 0.9 * c.TOL["x_deg"]) / max(g, 1e-6)
+        want = min(c.BASE_MIN_STEP_DEG, cap, c.AXES["x_deg"]["max"])
+        return sign * want if abs(u_x) < want else u_x
+
+    # ------------------------------------------------ 任务 09：落点微调（试探 + 学习）
+    def _trim_edges(self):
+        c = self.cfg
+        if c.TRIM_LEARN_EDGES:
+            return sorted(float(x) for x in c.TRIM_LEARN_EDGES)
+        lo, hi = sorted((c.REACH_NEAR_D, c.REACH_FAR_D))
+        return [round(lo + (hi - lo) / 3.0, 1), round(lo + 2 * (hi - lo) / 3.0, 1)]
+
+    def _trim_seg(self, d):
+        """物块深度在第几段（0 = 近）"""
+        return sum(1 for e in self._trim_edges() if d >= e)
+
+    def _new_trim_state(self):
+        n = len(self._trim_edges()) + 1
+        return {"edges": self._trim_edges(), "probe_first": -1,
+                "segments": [{"trim_deg": 0.0, "direct_ok": 0, "probe_ok_left": 0, "probe_ok_right": 0,
+                              "probe_ok_mm": [], "failed": 0} for _ in range(n)]}
+
+    def _load_trim(self):
+        st = None
+        if self.trim_path and os.path.exists(self.trim_path):
+            try:
+                with open(self.trim_path, encoding="utf-8") as f:
+                    st = json.load(f)
+            except (OSError, ValueError):
+                st = None
+        if st and st.get("edges") != self._trim_edges():
+            self.say(f"学到的落点微调是按旧的深度分段 {st.get('edges')} 学的，现在分段是 {self._trim_edges()}，重新开始学")
+            st = None
+        return st or self._new_trim_state()
+
+    def _save_trim(self):
+        if not self.trim_path or self.trim_state is None:
+            return
+        tmp = self.trim_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.trim_state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.trim_path)
+
+    def learned_trim(self, d):
+        """这个深度学到的微调（度）；没打开 TRIM_LEARN 就是 0"""
+        if self.trim_state is None:
+            return 0.0
+        return self.trim_state["segments"][self._trim_seg(d)]["trim_deg"]
+
+    def _probe_for(self, fails):
+        """第 fails 次失败之后那一次伸出的试探量（mm，偏右为正）：∓p、±p、∓2p ……"""
+        c = self.cfg
+        p = c.GRASP_PROBE_MM
+        if p <= 0 or fails <= 0:
+            return 0.0
+        if c.GRASP_PROBE_FIRST == "left":
+            first = -1
+        elif c.GRASP_PROBE_FIRST == "right":
+            first = 1
+        else:
+            first = self.trim_state["probe_first"] if self.trim_state else getattr(self, "_probe_first", -1)
+        sign = first if fails % 2 == 1 else -first
+        return sign * p * ((fails + 1) // 2)
+
+    def _flip_probe_first(self):
+        if self.trim_state is not None:
+            self.trim_state["probe_first"] = -self.trim_state["probe_first"]
+        else:
+            self._probe_first = -getattr(self, "_probe_first", -1)
+
+    def _learn_trim(self, d, probe_mm, probe_deg, ok):
+        """一次抓取（一个物块）结束后更新学到的微调"""
+        c = self.cfg
+        if self.trim_state is None:
+            return
+        seg = self.trim_state["segments"][self._trim_seg(d)]
+        if not ok:
+            seg["failed"] += 1                   # 连续失败：说明不了偏差往哪边，只记录
+        elif not probe_mm:
+            seg["direct_ok"] += 1                # 直接成功：现在的微调就合适，不改
+        elif self.learn:
+            old = seg["trim_deg"]
+            seg["trim_deg"] = round(max(-c.TRIM_MAX_DEG, min(c.TRIM_MAX_DEG, old + c.TRIM_LEARN_RATE * probe_deg)), 3)
+            seg["probe_ok_left" if probe_mm < 0 else "probe_ok_right"] += 1
+            seg["probe_ok_mm"] = (seg["probe_ok_mm"] + [probe_mm])[-20:]
+            self.say(f"学习落点：深度 {d:.0f}mm 那一段，试探 {probe_mm:+.0f}mm 抓到了 → 微调 {old:+.2f}° → "
+                     f"{seg['trim_deg']:+.2f}°")
+        self._save_trim()
+
     # ------------------------------------------------ 抓取
+    def reach_pose(self, d):
+        """按深度插值伸出姿态：标了 reach_mid（和 REACH_MID_D）就近-中-远分段，否则近-远两点（原行为）"""
+        c = self.cfg
+        near, far = c.POSES["reach_near"], c.POSES["reach_far"]
+        t = (d - c.REACH_NEAR_D) / (c.REACH_FAR_D - c.REACH_NEAR_D)
+        mid, dm = c.POSES.get("reach_mid"), getattr(c, "REACH_MID_D", None)
+        if mid and dm is not None and min(c.REACH_NEAR_D, c.REACH_FAR_D) < dm < max(c.REACH_NEAR_D, c.REACH_FAR_D):
+            tm = (dm - c.REACH_NEAR_D) / (c.REACH_FAR_D - c.REACH_NEAR_D)
+            if t <= tm:
+                return lerp_pose(near, mid, t / tm), t
+            return lerp_pose(mid, far, (t - tm) / (1.0 - tm)), t
+        return lerp_pose(near, far, t), t
+
     def grasp(self, m):
         """伸出 → 合爪 → 抬升；返回是否确认抓到"""
         c = self.cfg
         self._grasp_ref = m
-        t = (m.d - c.REACH_NEAR_D) / (c.REACH_FAR_D - c.REACH_NEAR_D)
+        reach, t = self.reach_pose(m.d)
         if not 0 <= t <= 1 and not c.REACH_RANGE_OK:
             raise DeviceError(f"物块深度 {m.d:.0f}mm 超出机械臂范围")
-        reach = lerp_pose(c.POSES["reach_near"], c.POSES["reach_far"], t)
         # 左右微调：对准后爪子系统性偏左/偏右时，伸出前让底座多转一点（calib.py trim 设置）
         trim = c.GRASP_BASE_TRIM_DEG
-        bp = self.base_pulse(max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, self.base_deg + trim)))
+        # 任务 09：再加上 这个深度学到的微调 + 失败重试时的左右试探（默认都是 0）
+        learned = self.learned_trim(m.d)
+        probe_mm = self._probe_mm
+        probe_deg = math.degrees(math.atan2(probe_mm, max(m.d + c.R_CAM_MM, 50.0))) if probe_mm else 0.0
+        self._probe_deg = probe_deg
+        total = trim + learned + probe_deg
+        bp = self.base_pulse(max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, self.base_deg + total)))
 
         # 只记录不影响流程：bench.py 把这些和人工记录的真实结果放在一起统计
         pos = getattr(self.lift, "pos", None)
         self.last_grasp = {"x_deg": round(m.x_deg, 2), "y": round(m.y, 1), "d": round(m.d, 1),
                            "base_deg": round(self.base_deg, 2), "lift_cm": None if pos is None else round(pos, 2),
                            "t": round(t, 3), "trim_deg": trim}
-        self.say(f"抓取：深度 {m.d:.0f}mm，插值 t={max(0.0, min(1.0, t)):.2f}，底座 {self.base_deg:+.1f}°"
-                 + (f"（微调 {trim:+.1f}°）" if trim else ""))
+        if learned or probe_mm:
+            self.last_grasp.update({"learned_trim_deg": round(learned, 3), "probe_mm": probe_mm,
+                                    "trim_total_deg": round(total, 3)})
+        extra = ""
+        if learned or probe_mm:
+            extra = f"（微调 {total:+.1f}° = 固定 {trim:+.1f}° + 学到 {learned:+.2f}° + 试探 {probe_mm:+.0f}mm）"
+        elif trim:
+            extra = f"（微调 {trim:+.1f}°）"
+        self.say(f"抓取：深度 {m.d:.0f}mm，插值 t={max(0.0, min(1.0, t)):.2f}，底座 {self.base_deg:+.1f}°" + extra)
         self.arm.move({c.CLAW_ID: c.CLAW_OPEN}, 300)
-        self.arm.move({**c.POSES["ready"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
-        self.arm.move({**reach, c.BASE_ID: bp}, c.ARM_SLOW_MS)
+        self._arm({**c.POSES["ready"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
+        self._arm({**reach, c.BASE_ID: bp}, c.ARM_SLOW_MS)
         self.arm.move({c.CLAW_ID: c.CLAW_CLOSE}, 500)
 
         verify = c.VERIFY
@@ -357,7 +519,7 @@ class GraspTask:
         self.lift.move_by(c.LIFT_AFTER_GRASP_CM)
         self._lifted = True
         m_after = self.measure() if verify in ("lift_check", "auto") else None
-        self.arm.move({**c.POSES["carry"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
+        self._arm({**c.POSES["carry"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
 
         if verify == "none":
             return True
@@ -381,6 +543,13 @@ class GraspTask:
         g, gf = c.GOAL, getattr(c, "GOAL_FAR", None)
         if c.USE_CHASSIS or not gf or m is None or gf["d"] == g["d"]:
             return g
+        gm = getattr(c, "GOAL_MID", None)
+        if gm and min(g["d"], gf["d"]) < gm["d"] < max(g["d"], gf["d"]):
+            # 任务 09：标了中间点就分段插值（近-中、中-远）
+            a, b = (g, gm) if (m.d - gm["d"]) * (g["d"] - gm["d"]) >= 0 else (gm, gf)
+            t = max(0.0, min(1.0, (m.d - a["d"]) / (b["d"] - a["d"])))
+            return {"x_deg": a["x_deg"] + (b["x_deg"] - a["x_deg"]) * t,
+                    "y": a["y"] + (b["y"] - a["y"]) * t, "d": m.d}
         t = max(0.0, min(1.0, (m.d - g["d"]) / (gf["d"] - g["d"])))
         return {"x_deg": g["x_deg"] + (gf["x_deg"] - g["x_deg"]) * t,
                 "y": g["y"] + (gf["y"] - g["y"]) * t,
@@ -429,7 +598,7 @@ class GraspTask:
         c = self.cfg
         ref = getattr(self, "_grasp_ref", None)    # 对准时实际看到的物块位置（没有就用 GOAL）
         g = {"x_deg": ref.x_deg, "y": ref.y, "d": ref.d} if ref is not None else c.GOAL
-        self.arm.move({**c.POSES["observe"], c.BASE_ID: bp}, c.ARM_MOVE_MS)     # 爪子不动
+        self._arm({**c.POSES["observe"], c.BASE_ID: bp}, c.ARM_MOVE_MS)     # 爪子不动
         self.lift.move_by(-c.LIFT_AFTER_GRASP_CM)
         self._lifted = False
         m = self.measure()
@@ -439,7 +608,7 @@ class GraspTask:
         if not still:                       # 抓到了：重新抬起、收回，准备放置
             self.lift.move_by(c.LIFT_AFTER_GRASP_CM)
             self._lifted = True
-            self.arm.move({**c.POSES["carry"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
+            self._arm({**c.POSES["carry"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
         return not still
 
     def _lower_back(self):
@@ -452,7 +621,7 @@ class GraspTask:
         c = self.cfg
         drop = c.POSES.get("drop")
         if drop:
-            self.arm.move({c.BASE_ID: self.base_pulse(), **drop}, c.ARM_MOVE_MS)
+            self._arm({c.BASE_ID: self.base_pulse(), **drop}, c.ARM_MOVE_MS, precise=False)
             self.arm.move({c.CLAW_ID: c.CLAW_OPEN}, 400)
         self.go_observe(0)
         self._lower_back()
@@ -477,6 +646,10 @@ class GraspTask:
         self.last_grasp = None          # 本次最后一次伸出抓取时的状态（没伸出过就是 None）
         self.last_aligned = None        # 本次最后一次对准结束时的测量
 
+        fails = 0                       # 这个物块伸出抓空了几次（任务 09：决定下一次的左右试探）
+        probed = False
+        self._probe_mm = 0.0
+        grasp_d = None
         self.go_observe(0)
         m = self.search()
         while m is not None and attempts < c.MAX_ATTEMPTS:
@@ -499,14 +672,27 @@ class GraspTask:
                 result = "out_of_reach"
                 break
             steps += 1
+            self._probe_mm = self._probe_for(fails)
+            probed = probed or bool(self._probe_mm)
+            grasp_d = m_al.d
             if self.grasp(m_al):
                 result = "success"
                 self.place()
                 break
             result = "grasp_failed"
-            self.say("抓取失败，松开、退后重试")
+            fails += 1
+            nxt = self._probe_for(fails)
+            self.say("抓取失败，松开、退后重试" + (f"（下一次落点试探 {nxt:+.0f}mm）" if nxt else ""))
             self.release_and_back_off()
             m = self.measure() or self.search()
+
+        # 任务 09：按这个物块的结果学习落点微调（没打开 TRIM_LEARN 时什么都不做）
+        if grasp_d is not None and self.trim_state is not None:
+            ok = result == "success"
+            self._learn_trim(grasp_d, self._probe_mm if ok else 0.0, getattr(self, "_probe_deg", 0.0), ok)
+        if probed:
+            self._flip_probe_first()        # 下一个物块第一次试探换一边（GRASP_PROBE_FIRST = "alternate"）
+        self._probe_mm = 0.0
 
         dt = self.clock.now() - t0
         err_norm = 0.0
@@ -520,6 +706,10 @@ class GraspTask:
         row = {"episode": self.episode, "result": result, "attempts": attempts, "steps": steps,
                "time_s": round(dt, 1), "err_norm": round(err_norm, 2), "score": round(score, 1),
                **{f"J_{n}": round(a.j, 4) for n, a in self.axes.items()}}
+        if c.GRASP_PROBE_MM > 0 or self.trim_state is not None:      # 打开任务 09 的功能时才多记几列
+            row["probe_used"] = int(probed)
+            row["grasp_d"] = None if grasp_d is None else round(grasp_d, 1)
+            row["trim_learned"] = None if grasp_d is None else round(self.learned_trim(grasp_d), 3)
         self._append_csv("episodes.csv", row)
         self.say(f"结果：{result}  步数 {steps}  用时 {dt:.1f}s  评分 {score:.1f}")
         return row

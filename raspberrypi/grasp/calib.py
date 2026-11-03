@@ -15,8 +15,11 @@
   python3 calib.py jog observe         键盘点动微调某个姿态，调好按 s 保存
   python3 calib.py auto                半自动：测升降轴方向/灵敏度、底座方向、相机半径（需要物块在画面里）
   python3 calib.py teach [near|far]    引导式标定抓取位置（倒推法）：不写 = 近远都标；near / far = 只标一个
+  python3 calib.py teach mid           再标一个中间深度的姿态 reach_mid（三点插值，任务 09）；teach mid off 删掉它
   python3 calib.py done                全部标定完：把 POSES_CALIBRATED 设为 true
   python3 calib.py trim 6              左右微调：爪子落点偏右 6mm（偏左写负数，可累加；trim reset 清零）
+  python3 calib.py trim                查看当前微调，以及自动学到的分段微调（TRIM_LEARN，任务 09）
+  python3 calib.py trim forget         清掉自动学到的分段微调（logs/learned_trim.json）
   python3 calib.py shake [姿态]        摆到某个姿态（不写 = 原地不动）静止 6 秒，用 K230 读数量机械臂抖多厉害
 """
 import importlib
@@ -58,6 +61,29 @@ def save_calib(updates):
     # 立刻重新加载配置：同一次运行里后面的步骤（例如 teach 里点动保存后再伸出去）要用新值，
     # 否则内存里还是旧姿态（2026-11-03 真机：点动调好 reach_near 后 teach 又伸回旧姿态，爪子悬在半空）
     importlib.reload(cfg)
+
+
+def remove_calib(keys, poses=()):
+    """从 calib.json 里删掉这些参数 / 姿态（恢复 config.py 默认值）"""
+    data = load_calib()
+    for k in keys:
+        data.pop(k, None)
+    for name in poses:
+        data.get("POSES", {}).pop(name, None)
+    tmp = cfg.CALIB_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, cfg.CALIB_FILE)
+    print("已从 calib.json 删除：", list(keys) + [f"POSES.{n}" for n in poses])
+    importlib.reload(cfg)
+
+
+def ensure_mid_pose():
+    """reach_mid 还没标过：先用 reach_near 和 reach_far 的中点当初值（之后点动调整）"""
+    if not cfg.POSES.get("reach_mid"):
+        near, far = cfg.POSES["reach_near"], cfg.POSES["reach_far"]
+        cfg.POSES["reach_mid"] = {k: int(round((near[k] + far[k]) / 2)) for k in near if k in far}
+    return cfg.POSES["reach_mid"]
 
 
 def ask(prompt):
@@ -313,7 +339,15 @@ def teach(only=None):
                 return
     except Exception as e:
         print("（读不到升降轴高度，跳过检查：", e, "）")
-    order = {"near": ("reach_near",), "far": ("reach_far",)}.get(only, ("reach_near", "reach_far"))
+    if only == "mid":
+        if cfg.POSES.get("reach_near") == cfg.POSES.get("reach_far"):
+            print("reach_near 和 reach_far 还是同一个姿态：先 teach near / teach far，再标中间")
+            return
+        ensure_mid_pose()
+        print(f"中间姿态：物块放在近（{cfg.REACH_NEAR_D:.0f}mm）和远（{cfg.REACH_FAR_D:.0f}mm）中间的深度，"
+              f"例如 {(cfg.REACH_NEAR_D + cfg.REACH_FAR_D) / 2:.0f}mm 左右")
+    order = {"near": ("reach_near",), "far": ("reach_far",), "mid": ("reach_mid",)}.get(
+        only, ("reach_near", "reach_far"))
     for which in order:
         if only is None and which == "reach_far" and                 ask("要不要再标定一个更远的抓取姿态 reach_far（用于插值）？[y/N] ") != "y":
             near = load_calib().get("REACH_NEAR_D", cfg.REACH_NEAR_D)
@@ -329,6 +363,8 @@ def teach(only=None):
                 return
             if a == "j":
                 jog(which, cam)
+                if which == "reach_mid":
+                    ensure_mid_pose()
                 arm_move({**pose_pulses(which), cfg.CLAW_ID: cfg.CLAW_OPEN}, 800)
                 continue
             arm_move({cfg.CLAW_ID: cfg.CLAW_CLOSE}, 600)
@@ -344,9 +380,17 @@ def teach(only=None):
             print("相机看不到物块：observe 姿态离物块太近/角度不对。用 `calib.py jog observe` 把相机调得更往后、往上，再重来")
             return
         x, y, d, xd, _ = m
-        upd = {"REACH_NEAR_D" if which == "reach_near" else "REACH_FAR_D": round(d)}
+        d_key, g_key = {"reach_near": ("REACH_NEAR_D", "GOAL"), "reach_far": ("REACH_FAR_D", "GOAL_FAR"),
+                        "reach_mid": ("REACH_MID_D", "GOAL_MID")}[which]
+        upd = {d_key: round(d)}
         g_here = {"x_deg": round(xd, 2), "y": round(y, 1), "d": round(d, 1)}
-        upd["GOAL" if which == "reach_near" else "GOAL_FAR"] = g_here
+        upd[g_key] = g_here
+        if which == "reach_mid":
+            upd["POSES"] = {"reach_mid": {k: v for k, v in ensure_mid_pose().items()
+                                          if k not in (cfg.CLAW_ID, cfg.BASE_ID)}}
+            lo, hi = sorted((cfg.REACH_NEAR_D, cfg.REACH_FAR_D))
+            if not lo < d < hi:
+                print(f"⚠ 中间姿态的深度 {d:.0f}mm 不在近/远 {lo:.0f}~{hi:.0f}mm 之间，程序不会用它（仍按两点插值）")
         if ask(f"保存 {upd}？[y/N] ") == "y":
             save_calib(upd)
 
@@ -389,11 +433,20 @@ def trim(args):
       爪子落点比物块中心偏右 6mm → calib.py trim 6（偏左就写负数）；可以多次累加；calib.py trim reset 清零
     """
     cur = float(load_calib().get("GRASP_BASE_TRIM_DEG", cfg.GRASP_BASE_TRIM_DEG))
+    learned = os.path.join(HERE, cfg.LOG_DIR, cfg.TRIM_LEARN_FILE)
     if not args:
         print(f"当前左右微调：{cur:+.2f}°（底座右转为正）")
+        show_learned_trim(learned)
         return
     if args[0] == "reset":
         save_calib({"GRASP_BASE_TRIM_DEG": 0.0})
+        return
+    if args[0] == "forget":
+        if os.path.exists(learned):
+            os.remove(learned)
+            print("已删除自动学到的分段微调：", learned)
+        else:
+            print("还没有自动学到的分段微调")
         return
     mm = float(args[0])
     depth = float(args[1]) if len(args) > 1 else 180.0
@@ -402,6 +455,22 @@ def trim(args):
     print(f"爪子偏{'右' if mm > 0 else '左'} {abs(mm):.0f}mm（按深度 {depth:.0f}mm 算）→ 底座多转 {delta:+.2f}°，"
           f"微调从 {cur:+.2f}° 改为 {new:+.2f}°")
     save_calib({"GRASP_BASE_TRIM_DEG": new})
+
+
+def show_learned_trim(path):
+    """打印自动学到的分段微调（TRIM_LEARN）"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        print("自动学到的分段微调：没有" + ("" if cfg.TRIM_LEARN else "（TRIM_LEARN 没打开）"))
+        return
+    e = st.get("edges", [])
+    bounds = ["近"] + [f"{x:.0f}" for x in e] + ["远"]
+    print("自动学到的分段微调（加在上面的固定微调上）" + ("" if cfg.TRIM_LEARN else "：TRIM_LEARN 没打开，现在不生效"))
+    for i, seg in enumerate(st.get("segments", [])):
+        print(f"  深度 {bounds[i]}~{bounds[i + 1]}mm：{seg['trim_deg']:+.2f}°   直接抓到 {seg['direct_ok']} 次，"
+              f"试探抓到 左 {seg['probe_ok_left']} / 右 {seg['probe_ok_right']} 次，都没抓到 {seg['failed']} 次")
 
 
 def main(argv):
@@ -436,7 +505,10 @@ def main(argv):
     elif cmd == "auto":
         auto()
     elif cmd == "teach":
-        teach(args[0] if args else None)
+        if args[:2] == ["mid", "off"]:
+            remove_calib(["REACH_MID_D", "GOAL_MID"], ["reach_mid"])
+        else:
+            teach(args[0] if args else None)
     elif cmd == "done":
         save_calib({"POSES_CALIBRATED": True})
     elif cmd == "trim":

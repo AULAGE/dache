@@ -867,6 +867,234 @@ def test_bench():
         cfg.POSES, cfg.USE_CHASSIS = saved
 
 
+# ------------------------------------------------------------ 任务 09：抓取精度
+def test_accuracy():
+    print("抓取精度（任务 09：消回差、最小步长、左右试探、学习微调、三点插值）")
+    import config as cfg
+    import calib
+    import sim
+    from task import GraspTask
+
+    class Rec:                                  # 记录发给机械臂的每一帧
+        def __init__(self): self.sent = []
+        def move(self, pulses, ms): self.sent.append((dict(pulses), ms))
+
+    class Clock:
+        t = 0.0
+        def now(self): return self.t
+        def sleep(self, s): self.t += max(0.0, s)
+
+    keys = ("BASE_BACKLASH_DEG", "BASE_APPROACH_DIR", "BASE_MIN_STEP_DEG", "GRASP_PROBE_MM", "GRASP_PROBE_FIRST",
+            "TRIM_LEARN", "TRIM_LEARN_RATE", "TRIM_MAX_DEG", "TRIM_LEARN_EDGES", "REACH_MID_D", "GOAL_MID")
+    saved = {k: getattr(cfg, k) for k in keys}
+    saved_poses, saved_goal = dict(cfg.POSES), dict(cfg.GOAL)
+    tmp = tempfile.mkdtemp(prefix="acc_")
+    try:
+        check("新参数都在 calib.json 白名单里", all(k in cfg.CALIB_KEYS for k in keys))
+        check("默认全部关闭", cfg.BASE_BACKLASH_DEG == 0 and cfg.BASE_MIN_STEP_DEG == 0 and cfg.GRASP_PROBE_MM == 0
+              and not cfg.TRIM_LEARN and cfg.REACH_MID_D is None and cfg.GOAL_MID is None
+              and "reach_mid" not in cfg.POSES)
+
+        # ---- 消回差
+        arm = Rec()
+        t = GraspTask(cfg, Clock(), None, None, arm, None, verbose=False, learn=False)
+        for deg in (5, 2, 2):
+            t.set_base(deg)
+        check("关闭时：每次转底座只发一帧（和原来一样）", len(arm.sent) == 3)
+        cfg.BASE_BACKLASH_DEG = 2.0
+        arm = Rec()
+        t = GraspTask(cfg, Clock(), None, None, arm, None, verbose=False, learn=False)
+        t.set_base(0)                                   # 不知道之前从哪边来：先过头再回来
+        n0 = len(arm.sent)
+        t.set_base(5)                                   # 右转 = 逼近方向：直接走
+        n1 = len(arm.sent)
+        t.set_base(2)                                   # 左转：先转到 0°（多 2°）再右转回 2°
+        last = [p[6] for p, _ in arm.sent[n1:]]
+        n2 = len(arm.sent)
+        t.set_base(2)                                   # 原地、上一段是右转：不动
+        check("消回差：位置未知时先过头再回来", n0 == 2 and arm.sent[0][0][6] < arm.sent[1][0][6])
+        check("消回差：顺着逼近方向转只发一帧", n1 - n0 == 1)
+        p2 = t.base_pulse(2)
+        check("消回差：反方向转先多转 2° 再回来", last == [p2 - 22, p2], str(last))
+        check("消回差：只动底座时回程用时按 2° 算", arm.sent[n1 + 1][1] == 150, str(arm.sent[n1 + 1][1]))
+        check("消回差：原地再发不多转", len(arm.sent) - n2 == 1)
+        cfg.BASE_APPROACH_DIR = -1
+        arm = Rec()
+        t = GraspTask(cfg, Clock(), None, None, arm, None, verbose=False, learn=False)
+        t.set_base(0)
+        t.set_base(5)
+        last = [p[6] for p, _ in arm.sent[2:]]
+        check("BASE_APPROACH_DIR=-1：右转时先多转再左转回来", last == [t.base_pulse(5) + 22, t.base_pulse(5)], str(last))
+        cfg.BASE_APPROACH_DIR, cfg.BASE_BACKLASH_DEG = 1, 0.0
+
+        # ---- 最小步长
+        cfg.BASE_MIN_STEP_DEG = 2.5
+        t = GraspTask(cfg, Clock(), None, None, Rec(), None, verbose=False, learn=False)
+        check("最小步长：误差 +1.6°、算出 +1.4° → 放大到 +2.5°", abs(t._min_base_step(1.36, 1.6, 1.0) - 2.5) < 1e-9)
+        t.axes["x_deg"].j = -0.6
+        u = t._min_base_step(-2.0, -1.6, 1.0)
+        check("最小步长：方向跟误差走（误差为负 → 左转）", abs(u + 2.5) < 1e-9, f"{u:.2f}")
+        cfg.BASE_MIN_STEP_DEG = 5.0
+        t.axes["x_deg"].j = -1.0
+        u = t._min_base_step(1.36, 1.6, 1.0)
+        check("最小步长：不会冲出容差另一边（最多到 −0.9×容差）", abs(u - (1.6 + 0.9 * cfg.TOL["x_deg"])) < 1e-9,
+              f"{u:.2f}")
+        check("最小步长：大步子不变", t._min_base_step(8.0, 9.0, 1.0) == 8.0)
+        cfg.BASE_MIN_STEP_DEG = 0.0
+
+        # ---- 左右试探
+        cfg.GRASP_PROBE_MM, cfg.GRASP_PROBE_FIRST = 3.0, "left"
+        t = GraspTask(cfg, Clock(), None, None, Rec(), None, verbose=False, learn=False)
+        check("试探：第 1 次不试探，失败后依次 −p、+p、−2p", [t._probe_for(k) for k in range(4)] == [0, -3, 3, -6])
+        cfg.GRASP_PROBE_FIRST = "alternate"
+        t = GraspTask(cfg, Clock(), None, None, Rec(), None, verbose=False, learn=False)
+        a = t._probe_for(1)
+        t._flip_probe_first()
+        check("试探：alternate 每个物块换一边先试", a == -3 and t._probe_for(1) == 3)
+
+        # ---- 伸出时的底座 = 对准角度 + 固定微调 + 学到的 + 试探
+        class Lift:
+            pos = 10.0
+            def move_by(self, cm, timeout=30): pass
+        arm = Rec()
+        cfg.TRIM_LEARN = True
+        t = GraspTask(cfg, Clock(), None, Lift(), arm, None, log_dir=tmp, verbose=False)
+        t.trim_state["segments"][t._trim_seg(180)]["trim_deg"] = -1.0
+        t._probe_mm = 3.0
+        cfg.VERIFY, v0 = "none", cfg.VERIFY
+        t.grasp(devices.Measurement(0, 0, 180, 5))
+        cfg.VERIFY = v0
+        want = t.base_pulse(-1.0 + math.degrees(math.atan2(3.0, 180 + cfg.R_CAM_MM)))
+        got = [p[6] for p, _ in arm.sent if 6 in p]
+        check("伸出时底座 = 学到的 −1° + 试探 +3mm", got and all(g == want for g in got), f"{got} / {want}")
+        check("last_grasp 记录了学到的微调和试探量", t.last_grasp.get("probe_mm") == 3.0
+              and t.last_grasp.get("learned_trim_deg") == -1.0 and t.last_grasp["trim_deg"] == cfg.GRASP_BASE_TRIM_DEG)
+
+        # ---- 学习
+        cfg.TRIM_LEARN_RATE, cfg.TRIM_MAX_DEG = 0.5, 3.0
+        t = GraspTask(cfg, Clock(), None, None, Rec(), None, log_dir=tmp, verbose=False)
+        t.trim_state = t._new_trim_state()
+        lo, hi = sorted((cfg.REACH_NEAR_D, cfg.REACH_FAR_D))
+        check("默认分段：把近~远三等分", t._trim_edges() == [round(lo + (hi - lo) / 3, 1), round(lo + 2 * (hi - lo) / 3, 1)]
+              and t._trim_seg(lo) == 0 and t._trim_seg(hi) == 2, str(t._trim_edges()))
+        d = hi
+        t._learn_trim(d, -3.0, -1.0, True)
+        seg = t.trim_state["segments"][2]
+        check("试探 −3mm 抓到 → 这一段微调往左挪 0.5×", abs(seg["trim_deg"] + 0.5) < 1e-9 and seg["probe_ok_left"] == 1)
+        t._learn_trim(d, 0.0, 0.0, True)
+        t._learn_trim(d, 0.0, 0.0, False)
+        check("直接抓到 / 都没抓到 → 微调不变，只计数", abs(seg["trim_deg"] + 0.5) < 1e-9 and seg["direct_ok"] == 1
+              and seg["failed"] == 1)
+        check("别的深度段不受影响", t.trim_state["segments"][0]["trim_deg"] == 0.0)
+        for _ in range(20):
+            t._learn_trim(d, -3.0, -1.0, True)
+        check("学到的微调限制在 ±TRIM_MAX_DEG", seg["trim_deg"] == -3.0)
+        t2 = GraspTask(cfg, Clock(), None, None, Rec(), None, log_dir=tmp, verbose=False)
+        check("学到的微调存文件、下次启动接着用", t2.learned_trim(d) == -3.0)
+        t3 = GraspTask(cfg, Clock(), None, None, Rec(), None, log_dir=tmp, verbose=False, learn=False)
+        t3._learn_trim(d, 3.0, 1.0, True)
+        check("--no-learn：用学到的值但不再改", t3.learned_trim(d) == -3.0)
+        cfg.TRIM_LEARN_EDGES = [170, 190]
+        t4 = GraspTask(cfg, Clock(), None, None, Rec(), None, log_dir=tmp, verbose=False)
+        check("深度分段改了 → 旧的学习结果作废、重新学", t4.learned_trim(d) == 0.0 and t4._trim_edges() == [170, 190])
+        cfg.TRIM_LEARN_EDGES = None
+        cfg.TRIM_LEARN = False
+        check("TRIM_LEARN 关闭：学到的微调为 0",
+              GraspTask(cfg, Clock(), None, None, Rec(), None, log_dir=tmp, verbose=False).learned_trim(d) == 0.0)
+        show = io_capture(lambda: calib.show_learned_trim(os.path.join(tmp, cfg.TRIM_LEARN_FILE)))
+        check("calib.py trim 显示学到的分段微调", "-3.00°" in show and "直接抓到" in show, show.splitlines()[-1])
+
+        # ---- 三点插值
+        cfg.POSES = dict(saved_poses)
+        cfg.POSES["reach_near"] = {2: 1500, 3: 700, 4: 700, 5: 1900}
+        cfg.POSES["reach_far"] = {2: 1500, 3: 800, 4: 800, 5: 1700}
+        t = GraspTask(cfg, Clock(), None, None, Rec(), None, verbose=False, learn=False)
+        dm = (cfg.REACH_NEAR_D + cfg.REACH_FAR_D) / 2
+        two, tt = t.reach_pose(dm)
+        check("没标 reach_mid：两点插值（原行为）", two == devices.lerp_pose(cfg.POSES["reach_near"],
+                                                             cfg.POSES["reach_far"], 0.5) and abs(tt - 0.5) < 1e-9)
+        cfg.POSES["reach_mid"] = {2: 1500, 3: 760, 4: 740, 5: 1850}
+        cfg.REACH_MID_D = dm
+        mid, _ = t.reach_pose(dm)
+        check("标了 reach_mid：中间深度正好用 reach_mid", all(abs(mid[k] - cfg.POSES["reach_mid"][k]) < 1e-9 for k in mid))
+        q, _ = t.reach_pose(cfg.REACH_NEAR_D + (dm - cfg.REACH_NEAR_D) / 2)
+        check("近和中之间按近-中插值", abs(q[3] - 730) < 1e-9 and abs(q[5] - 1875) < 1e-9, str(q))
+        q, _ = t.reach_pose(cfg.REACH_FAR_D + 50)
+        check("超出远端：用 reach_far", q == {k: float(v) for k, v in cfg.POSES["reach_far"].items()} or
+              all(abs(q[k] - cfg.POSES["reach_far"][k]) < 1e-9 for k in q))
+        cfg.REACH_MID_D = cfg.REACH_FAR_D + 10
+        check("REACH_MID_D 不在近远之间 → 不用它", t.reach_pose(dm)[0] == two)
+        cfg.REACH_MID_D = None
+
+        cfg.USE_CHASSIS, uc = False, cfg.USE_CHASSIS
+        gf0 = cfg.GOAL_FAR
+        cfg.GOAL.update({"x_deg": -7.0, "y": 70.0, "d": 156.0})
+        cfg.GOAL_FAR = {"x_deg": -7.4, "y": 43.0, "d": 216.0}
+        g_two = t.goal_for(devices.Measurement(0, 0, 186, 5))
+        cfg.GOAL_MID = {"x_deg": -7.2, "y": 60.0, "d": 186.0}
+        g_mid = t.goal_for(devices.Measurement(0, 0, 186, 5))
+        g_q = t.goal_for(devices.Measurement(0, 0, 201, 5))
+        cfg.GOAL_MID = None
+        check("GOAL_MID：中间深度的目标 Y 用标定值（两点插值是 56.5）", abs(g_two["y"] - 56.5) < 1e-9
+              and abs(g_mid["y"] - 60.0) < 1e-9 and abs(g_q["y"] - 51.5) < 1e-9, f"{g_mid['y']} / {g_q['y']}")
+        cfg.USE_CHASSIS, cfg.GOAL_FAR = uc, gf0
+        cfg.GOAL.clear()
+        cfg.GOAL.update(saved_goal)
+
+        # ---- calib.py teach mid 的初值
+        cfg.POSES.pop("reach_mid", None)
+        calib.cfg = cfg
+        m0 = calib.ensure_mid_pose()
+        check("teach mid：没标过时用近、远的中点当初值", m0 == {2: 1500, 3: 750, 4: 750, 5: 1800}, str(m0))
+
+        # ---- 仿真：落点偏差模型
+        cfg.POSES = dict(sim.SIM_POSES)
+        cfg.USE_CHASSIS = False
+        cfg.SIM_GRASP_BIAS_MM, cfg.SIM_GRIP_TOL_MM = (4.0, 4.0), 5.0
+        car = sim.make_car(cfg, 3)
+        cfg.SIM_GRASP_BIAS_MM, cfg.SIM_GRIP_TOL_MM = 0.0, 0.0
+        car0 = sim.make_car(cfg, 3)
+        check("仿真新因素不改变原来每台车的随机量", car["box_bias_px"] == car0["box_bias_px"]
+              and car["coast_tau"] == car0["coast_tau"] and car["grasp_bias_mm"] == 4.0)
+        w, clock, cam, lift, arm2, ch = sim.make_sim(cfg, 3, 1.0, 0.0, car0)
+        check("仿真新因素默认关（按原来的 3° 判断）", not arm2._lateral_mode())
+        cfg.SIM_GRIP_TOL_MM = 5.0
+        w, clock, cam, lift, arm2, ch = sim.make_sim(cfg, 3, 1.0, 0.0, car)
+        dd = 180.0
+        w.block = [80 + dd, 0.0, w.CAM_Z0 + 10 * w.lift_cm + cfg.GOAL["y"]]
+        lat, tol = arm2._lateral(0.0, dd)
+        check("落点偏右 4mm：正对的物块在爪子左边 4mm", abs(lat + 4.0) < 1e-9 and tol == 5.0)
+        arm2.move({**cfg.POSES["observe"], 6: 1500, 1: 500}, 500)
+        arm2.move(cfg.POSES["reach_near"], 500)
+        arm2.move({1: cfg.CLAW_CLOSE}, 300)
+        check("落点偏差在容差内 → 抓得到（90% 概率那一档除外）", arm2.last_lateral_mm is not None
+              and abs(arm2.last_lateral_mm + 4.0) < 0.5, f"{arm2.last_lateral_mm:.2f}")
+        trim = -math.degrees(math.atan2(4.0, dd))
+        cfg.SIM_SERVO_BACKLASH_US = 0              # 只验证偏差模型（回差会吃掉一部分补偿，见上面消回差）
+        w, clock, cam, lift, arm2, ch = sim.make_sim(cfg, 3, 1.0, 0.0, car)
+        w.block = [80 + dd, 0.0, w.CAM_Z0 + cfg.GOAL["y"]]
+        arm2.move({**cfg.POSES["observe"], 6: int(round(1500 + trim * cfg.BASE_US_PER_DEG)), 1: 500}, 500)
+        arm2.move(cfg.POSES["reach_near"], 500)
+        arm2.move({1: cfg.CLAW_CLOSE}, 300)
+        check("底座往左补 atan(4/180) → 落点偏差基本消掉", abs(arm2.last_lateral_mm) < 0.6, f"{arm2.last_lateral_mm:.2f}")
+    finally:
+        for k, v in saved.items():
+            setattr(cfg, k, v)
+        cfg.POSES = saved_poses
+        cfg.GOAL.clear()
+        cfg.GOAL.update(saved_goal)
+        importlib.reload(cfg)
+
+
+def io_capture(fn):
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn()
+    return buf.getvalue()
+
+
 # ------------------------------------------------------------ 仿真回归
 def test_sim():
     print("仿真回归（整套流程）")
@@ -877,8 +1105,10 @@ def test_sim():
     saved = (cfg.POSES, cfg.USE_CHASSIS)
     try:
         fixes = {"ARM_USB_ROBUST": True, "SEARCH_CONFIRM": True, "BASE_LIMIT_BACKUP_MM": 150}
+        # 任务 09 全开（只测无底盘：任务 09 针对无底盘；有底盘 6 台车×100 次对比见 09_报告.md，差别在噪声内）
+        acc = {"BASE_BACKLASH_DEG": 2.0, "BASE_MIN_STEP_DEG": 1.0, "GRASP_PROBE_MM": 3.0, "TRIM_LEARN": True}
         for n, seed, nc, need, extra in ((40, 31, False, 0.85, {}), (30, 33, True, 0.85, {}),
-                                         (40, 31, False, 0.85, fixes)):
+                                         (40, 31, False, 0.85, fixes), (30, 33, True, 0.85, acc)):
             importlib.reload(cfg)
             for k, v in extra.items():
                 setattr(cfg, k, v)
@@ -887,7 +1117,7 @@ def test_sim():
             with contextlib.redirect_stdout(buf):
                 rate = main.run_sim(n, seed, True, nc)
             line = [l for l in buf.getvalue().splitlines() if l.startswith("全部")][0]
-            check(f"{'无' if nc else '有'}底盘 {n} 次{'（打开任务 02 的改进开关）' if extra else ''}，"
+            check(f"{'无' if nc else '有'}底盘 {n} 次{('（打开任务 09 的开关）' if 'TRIM_LEARN' in extra else '（打开任务 02 的改进开关）') if extra else ''}，"
                   f"真实抓到 ≥ {need:.0%}", rate >= need, line.split(":", 1)[1].strip())
     finally:
         importlib.reload(cfg)
@@ -898,7 +1128,8 @@ if __name__ == "__main__":
     quick = len(sys.argv) > 1 and sys.argv[1] == "quick"
     real_serial = devices.serial
     for t in (test_arm, test_k230, test_lift, test_chassis, test_chassis_fw, test_calib_override,
-              test_step_and_guard, test_geometry, test_ghost, test_sim_factors, test_bench):
+              test_step_and_guard, test_geometry, test_ghost, test_sim_factors, test_bench,
+              test_accuracy):
         try:
             t()
         except Exception as e:
