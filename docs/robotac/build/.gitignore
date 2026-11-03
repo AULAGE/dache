@@ -1,0 +1,5 @@
+# 生成结果不提交（样例见 sample/）
+out/
+# 照片、视频、bench.csv 体积大，放在本地 media/ 里，不提交
+media/*
+!media/README.md

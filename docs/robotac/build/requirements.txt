@@ -1,0 +1,5 @@
+# 比赛材料生成脚本的依赖：pip install -r requirements.txt
+python-docx>=1.1
+python-pptx>=0.6.23
+matplotlib>=3.7
+Pillow>=9.0
