@@ -12,6 +12,7 @@
       python3 main.py --once
   真机，一直抓（开机自启用这个）：
       python3 main.py
+  加 --dashboard 开网页看板（手机打开 http://<树莓派IP>:8080）；比赛演示用 demo.py
 
   运行日志自动保存在 logs/run_日期_时间.log
 """
@@ -288,14 +289,39 @@ def get_recorder(clock, cam, enable=False):
     return _RECORDER
 
 
-def attach_task(task, devs, clock, step=False, guard=None, record=False):
-    """把（重新）打开的设备装到抓取任务上；task 为 None 时新建（bench.py 也用）"""
+_DASHBOARD = None
+
+
+def get_dashboard(clock, cam, enable=False):
+    """--dashboard 时返回看板的 TaskMonitor（整个进程共用一个，网页服务在后台线程）；否则 None"""
+    global _DASHBOARD
+    if not enable:
+        return None
+    if _DASHBOARD is None:
+        import dashboard
+        _DASHBOARD = dashboard.TaskMonitor(cfg, clock, cam)
+        _DASHBOARD.server = dashboard.start(_DASHBOARD, cfg.DASHBOARD_PORT)
+    else:
+        _DASHBOARD.set_devices(clock, cam)
+    return _DASHBOARD
+
+
+def attach_task(task, devs, clock, step=False, guard=None, record=False, dashboard=False, monitor=None):
+    """
+    把（重新）打开的设备装到抓取任务上；task 为 None 时新建（bench.py 也用）
+    dashboard=True 开网页看板；monitor 直接给一个 dashboard.TaskMonitor（demo.py 用）。默认都不挂，行为不变
+    """
     cam, lift, arm, chassis = devs
     rec = get_recorder(clock, cam, record)
     if rec is not None:                  # 记录在里层：单步模式下按了回车、真的执行了才记
         from recorder import RecordProxy
         lift, arm, chassis = (RecordProxy(lift, "lift", rec), RecordProxy(arm, "arm", rec),
                               RecordProxy(chassis, "chassis", rec))
+    mon = monitor if monitor is not None else get_dashboard(clock, cam, dashboard)
+    if mon is not None:                  # 看板只记升降轴返回的高度，和记录器一样在单步代理里层
+        import dashboard as _dash
+        mon.set_devices(clock, cam)
+        lift = _dash.wrap_lift(lift, mon)
     if step:
         lift, arm, chassis = (StepProxy(lift, "升降轴"), StepProxy(arm, "机械臂"), StepProxy(chassis, "底盘"))
     if task is None:
@@ -305,10 +331,12 @@ def attach_task(task, devs, clock, step=False, guard=None, record=False):
     if rec is not None:
         from recorder import hook_task
         hook_task(task, rec)
+    if mon is not None:
+        _dash.hook_task(task, mon)
     return task
 
 
-def run_real(once, step, force, record=False):
+def run_real(once, step, force, record=False, dashboard=False):
     clock = RealClock()
     guard = ManualGuard(cfg.MANUAL_PROCESS)
     time.sleep(1.2)
@@ -332,7 +360,7 @@ def run_real(once, step, force, record=False):
                     if problems and not force:
                         print(f"有 {len(problems)} 项检查没通过，不启动（确认安全的话可以加 --force 跳过）")
                         return
-                task = attach_task(task, devs, clock, step, guard, record)
+                task = attach_task(task, devs, clock, step, guard, record, dashboard)
             try:
                 r = task.run_once()
             except ManualOverride as e:
@@ -369,6 +397,8 @@ if __name__ == "__main__":
     ap.add_argument("--check", action="store_true", help="只读自检：看各串口和下位机是否正常，不动任何东西")
     ap.add_argument("--record", action="store_true",
                     help="记录每条动作命令和 K230 每一帧到 logs/record_*.jsonl（论文数据；只记录，不改动作）")
+    ap.add_argument("--dashboard", action="store_true",
+                    help="开网页看板：浏览器打开 http://<树莓派IP>:8080（端口见 config.DASHBOARD_PORT；只看，不改动作）")
     a = ap.parse_args()
     if a.check:
         run_check()
@@ -379,4 +409,4 @@ if __name__ == "__main__":
             cfg.USE_CHASSIS = False
         sys.stdout = Tee(os.path.join(LOG_DIR, time.strftime("run_%Y%m%d_%H%M%S.log")))
         print("启动：", " ".join(sys.argv), " calib.json 覆盖：", sorted(cfg.CALIB_LOADED))
-        run_real(a.once, a.step, a.force, a.record)
+        run_real(a.once, a.step, a.force, a.record, a.dashboard)
