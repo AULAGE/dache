@@ -19,6 +19,7 @@
   python3 calib.py trim 6              左右微调：爪子落点偏右 6mm（偏左写负数，可累加；trim reset 清零）
   python3 calib.py shake [姿态]        摆到某个姿态（不写 = 原地不动）静止 6 秒，用 K230 读数量机械臂抖多厉害
 """
+import importlib
 import json
 import math
 import os
@@ -54,6 +55,9 @@ def save_calib(updates):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, cfg.CALIB_FILE)
     print("已保存到 calib.json：", json.dumps(updates, ensure_ascii=False))
+    # 立刻重新加载配置：同一次运行里后面的步骤（例如 teach 里点动保存后再伸出去）要用新值，
+    # 否则内存里还是旧姿态（2026-11-03 真机：点动调好 reach_near 后 teach 又伸回旧姿态，爪子悬在半空）
+    importlib.reload(cfg)
 
 
 def ask(prompt):
