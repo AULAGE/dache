@@ -105,6 +105,10 @@ SIM_GRASP_BIAS_VAR_MM = 0.0    #   偏差随深度变：近→远线性变化 ±
 SIM_GRIP_TOL_MM = 0.0          #   横向抓取容差 ±mm：爪子张开约 36mm、物块 24mm → (36−24)/2 = 6（估计）；0 = 用原来的 3°
 SIM_REACH_SHIFT = False        # 9 伸出时机械臂重心外移，把底座推到回差间隙的一侧（每台车固定哪一侧，估计）
 SIM_REACH_SAG_MM = 0.0         # 10 两点关节插值在中间深度的爪子高度偏差（t=0.5 处 mm，抛物线，两端为 0）；0 = 关
+# 任务 13 新增（默认关）
+SIM_CLAW_PUSH_P = 0.0          # 11 合爪没夹住时把物块推开的概率（0 = 关；估计值）
+SIM_CLAW_PUSH_MM = (10, 40)    #    推开多远
+SIM_CLAW_PUSH_MAX_EN = 3.0     #    只有物块离爪子不太远（偏差 / 抓取容差 ≤ 这个值）时才碰得到
 
 # ======================= 对准目标 =======================
 # [标定] 机械臂在 observe 姿态时，把物块放到"机械臂伸出去刚好能抓到"的位置，
@@ -259,6 +263,27 @@ VERIFY = "auto"
 VERIFY_DY_MM = 15.0       # 抬升后 y 变化小于这个值算抓到
 VERIFY_SAME_D_MM = 40.0   # 观察确认：深度和 GOAL 相差小于这个值，算"物块还在原位置"
 
+# —— 任务 13：提速 + 确认防误报 + 灵敏度学习去偏（全部默认关 = 原行为；仿真对比见 docs/cloud_tasks/results/13_报告.md，未在真机验证）——
+# 观察确认看整个画面：画面里任何位置还有物块（K230 已排除爪子脚忽略区；树莓派再排除 ghost 指纹）就算没抓到。
+# 不在原位置 = 物块被爪子推开了：打印推开了多远，这次结果记成 "pushed"，任务 09 的落点学习跳过这个物块。
+# False = 原行为（只看原位置附近 ±6°、±30mm、±40mm，物块被推开 2~3cm 时会误判成"抓到"）
+VERIFY_WHOLE_FRAME = False
+# 整画面确认时，比这个深度还近的读数不算（可能是爪子里抓着的那个物块）。0 = 不排除。
+# 真机上先在 IDE 里看"抓着物块回到观察姿态时画面里能不能看到它、深度多少"，看得到就设成比它大一点
+VERIFY_WHOLE_MIN_D_MM = 0.0
+# observe 确认模式下，合爪抬升后直接回观察姿态确认，去掉确认前那次 carry（确认抓到后放置前仍会收回到 carry）。
+# False = 原行为（合爪 → 抬升 → carry → 观察确认）
+VERIFY_SKIP_CARRY = False
+# 机械臂动作时间按"变化最大的舵机脉宽差"缩放：ms = clamp(Δ最大 × ARM_MS_PER_US, ARM_MIN_MS, 原来的时间)，
+# 只会更快、不会更慢；伸向物块那一步（ARM_SLOW_MS）不缩放；不知道舵机当前位置时（刚启动）用原来的时间。
+# False = 原行为（每个动作都是固定时间）
+ARM_MOVE_SCALE = False
+ARM_MS_PER_US = 0.8       # 每 1us 脉宽差给多少 ms（LDX-218 空载约 0.16s/60° ≈ 0.24ms/us，这里留 3 倍余量，估计值）
+ARM_MIN_MS = 200          # 缩放后最短的动作时间
+# 底座灵敏度只用"和上一次底座转动同方向"的对准步学习：换向那一步有一部分被回差吃掉，学进去会让 J 偏小（任务 11 发现）。
+# False = 原行为（每一步都学）
+LEARN_SAME_DIR_ONLY = False
+
 # ======================= 评分（只用于记录和比较参数，不参与控制） =======================
 # score = 100*成功 - 每步 2 分 - 最终误差/容差*5 - 用时(s)*0.5
 SCORE_STEP_COST = 2.0
@@ -286,6 +311,8 @@ CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "BASE_BACKLASH_DEG", "BASE_APPROACH_DIR", "BASE_MIN_STEP_DEG", "GRASP_PROBE_MM", "GRASP_PROBE_FIRST",
     "TRIM_LEARN", "TRIM_LEARN_RATE", "TRIM_MAX_DEG", "TRIM_LEARN_EDGES", "REACH_MID_D", "GOAL_MID",
     "GHOST_FINGERPRINT", "GHOST_FP_TOL", "GHOST_FP_MIN_HITS", "GHOST_FP_MAX",
+    "VERIFY_WHOLE_FRAME", "VERIFY_WHOLE_MIN_D_MM", "VERIFY_SKIP_CARRY", "ARM_MOVE_SCALE", "ARM_MS_PER_US",
+    "ARM_MIN_MS", "LEARN_SAME_DIR_ONLY",
 }
 
 

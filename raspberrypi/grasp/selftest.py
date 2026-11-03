@@ -1203,6 +1203,146 @@ def test_accuracy():
         importlib.reload(cfg)
 
 
+# ------------------------------------------------------------ 任务 13：提速 + 确认防误报 + 学习去偏
+def test_speed_verify():
+    print("提速与确认防误报（任务 13：整画面确认、去掉确认前 carry、动作时间缩放、同向才学 J）")
+    import config as cfg
+    import sim
+    from task import GraspTask
+    M = devices.Measurement
+
+    class Clock:
+        t = 0.0
+        def now(self): return self.t
+        def sleep(self, s): self.t += max(0.0, s)
+
+    class Rec:
+        def __init__(self): self.sent = []
+        def move(self, pulses, ms): self.sent.append((dict(pulses), ms))
+
+    class Lift:
+        pos = 10.0
+        def move_by(self, cm, timeout=30): pass
+
+    class Cam:                                  # 依次返回 seq 里的测量（用完了就一直 None）
+        def __init__(self, seq): self.seq = list(seq)
+        def measure(self, since, n, timeout): return self.seq.pop(0) if self.seq else None
+
+    keys = ("VERIFY_WHOLE_FRAME", "VERIFY_WHOLE_MIN_D_MM", "VERIFY_SKIP_CARRY", "ARM_MOVE_SCALE", "ARM_MS_PER_US",
+            "ARM_MIN_MS", "LEARN_SAME_DIR_ONLY")
+    saved = {k: getattr(cfg, k) for k in keys}
+    saved2 = {k: getattr(cfg, k) for k in ("VERIFY", "R_CAM_MM", "USE_CHASSIS")}
+    try:
+        check("新参数都在 calib.json 白名单里", all(k in cfg.CALIB_KEYS for k in keys))
+        check("默认全部关闭", not cfg.VERIFY_WHOLE_FRAME and not cfg.VERIFY_SKIP_CARRY and not cfg.ARM_MOVE_SCALE
+              and not cfg.LEARN_SAME_DIR_ONLY and cfg.VERIFY_WHOLE_MIN_D_MM == 0 and cfg.SIM_CLAW_PUSH_P == 0)
+
+        # ---- 动作时间缩放
+        def grasp_frames(over, see=()):
+            for k, v in over.items():
+                setattr(cfg, k, v)
+            arm = Rec()
+            t = GraspTask(cfg, Clock(), Cam(see), Lift(), arm, None, verbose=False, learn=False)
+            t.go_observe(0)
+            ok = t.grasp(M(0.0, 0.0, 180.0, 5))
+            for k in over:
+                setattr(cfg, k, saved.get(k, saved2.get(k)))
+            return arm.sent, ok, t
+
+        base, _, _ = grasp_frames({"VERIFY": "observe"})
+        check("关闭时：动作时间和原来一样（张爪 300、ready 1000、伸出 1200、合爪 500、carry 1000）",
+              [ms for _, ms in base[:6]] == [1000, 300, 1000, 1200, 500, 1000], str([ms for _, ms in base]))
+        fast, _, _ = grasp_frames({"VERIFY": "observe", "ARM_MOVE_SCALE": True})
+        p = cfg.POSES
+        want_carry = int(min(1000, max(cfg.ARM_MIN_MS, max(abs(p["carry"][k] - p["reach_near"][k]) for k in (4, 5))
+                                       * cfg.ARM_MS_PER_US)))
+        check("打开后：第一次动作不知道舵机在哪 → 用原来的时间", fast[0][1] == 1000)
+        check("打开后：张爪（已经张着，差 0）→ 最短 ARM_MIN_MS 和原值取小", fast[1][1] == min(300, cfg.ARM_MIN_MS))
+        check("打开后：伸向物块那一步保持慢速", fast[3][1] == cfg.ARM_SLOW_MS)
+        check("打开后：carry 按最大脉宽差缩放", fast[5][1] == want_carry, f"{fast[5][1]} / {want_carry}")
+        check("打开后：任何动作都不会比原来慢", all(f[1] <= b[1] for f, b in zip(fast, base)))
+        check("只改时间、不改脉宽（协议不变）", [f[0] for f in fast] == [b[0] for b in base])
+        cfg.ARM_MOVE_SCALE = True
+        arm = Rec()
+        t = GraspTask(cfg, Clock(), None, Lift(), arm, None, verbose=False, learn=False)
+        t.go_observe(0)
+        t.arm = Rec()                                      # 换了设备对象（重新打开串口）
+        t.go_observe(0)
+        check("换了机械臂设备后不再相信记住的位置", t.arm.sent[0][1] == cfg.ARM_MOVE_MS)
+        cfg.ARM_MOVE_SCALE = False
+
+        # ---- 去掉确认前的 carry
+        skip, ok, _ = grasp_frames({"VERIFY": "observe", "VERIFY_SKIP_CARRY": True})
+        carry = {**cfg.POSES["carry"], cfg.BASE_ID: 1500}
+        n_carry = lambda fr: sum(1 for pz, _ in fr if pz == carry)      # noqa: E731
+        check("observe 确认：原来抓到时 carry 两次，打开后只在放置前一次", n_carry(base) == 2 and n_carry(skip) == 1
+              and ok, f"{n_carry(base)} → {n_carry(skip)}")
+        auto, _, _ = grasp_frames({"VERIFY": "auto", "VERIFY_SKIP_CARRY": True}, see=[M(0, 0, 180, 5)] * 2)
+        check("VERIFY_SKIP_CARRY 只影响 observe 模式", n_carry(auto) == 1 and auto[5][0] == carry)
+
+        # ---- 整画面确认
+        far = M(30.0, 5.0, 205.0, 5)                       # 原位置 (0,0,180)：右 30mm、远 25mm
+        _, ok, _ = grasp_frames({"VERIFY": "observe"}, see=[far])
+        check("关闭时：物块被推到别处 → 原位置空了 → 判成抓到（误报，原行为）", ok)
+        _, ok, t = grasp_frames({"VERIFY": "observe", "VERIFY_WHOLE_FRAME": True}, see=[far, far])
+        check("整画面确认：画面别处还有物块 → 没抓到，记下推开了多远", not ok and t._pushed == (30.0, 5.0, 25.0),
+              str(t._pushed))
+        _, ok, t = grasp_frames({"VERIFY": "observe", "VERIFY_WHOLE_FRAME": True}, see=[far])
+        check("整画面确认：一闪而过（再测一次没有了）→ 按抓到处理", ok and t._pushed is None)
+        _, ok, t = grasp_frames({"VERIFY": "observe", "VERIFY_WHOLE_FRAME": True, "VERIFY_WHOLE_MIN_D_MM": 100.0},
+                                see=[M(0.0, 40.0, 70.0, 5)])
+        check("整画面确认：比 VERIFY_WHOLE_MIN_D_MM 还近的（爪子里的）不算", ok)
+        _, ok, _ = grasp_frames({"VERIFY": "observe", "VERIFY_WHOLE_FRAME": True}, see=[M(1.0, 1.0, 182.0, 5)])
+        check("整画面确认：原位置还在 → 没抓到（和原来一样）", not ok)
+
+        # ---- 同向才学 J（假底座：J = −1，回差 2°）
+        class GapArm:
+            def __init__(self): self.out, self.sent = 0.0, []
+            def move(self, pulses, ms):
+                self.sent.append((dict(pulses), ms))
+                if 6 in pulses:
+                    cmd = (pulses[6] - cfg.BASE_CENTER) / (cfg.BASE_US_PER_DEG * cfg.BASE_DIR)
+                    self.out = min(max(self.out, cmd - 1.0), cmd + 1.0)
+
+        class GapCam:
+            def __init__(self, arm): self.arm = arm
+            def measure(self, since, n, timeout):
+                xd = 5.0 - self.arm.out                    # 物块在底座 +5° 方向
+                return M(160.0 * math.tan(math.radians(xd)), 0.0, 160.0, n)
+
+        def learned_j(same):
+            cfg.LEARN_SAME_DIR_ONLY, cfg.R_CAM_MM, cfg.USE_CHASSIS = same, 0.0, False
+            arm = GapArm()
+            t = GraspTask(cfg, Clock(), GapCam(arm), Lift(), arm, None, verbose=False, learn=True)
+            t.set_base(20.0)                               # 搜索时一路右转过去
+            ok, _, _ = t.align(t.measure())                # 对准要左转回来：第一步换向，被回差吃掉 2°
+            return t.axes["x_deg"].j, t.learn_skipped_reversal, ok
+
+        j_all, sk0, ok0 = learned_j(False)
+        j_same, sk1, ok1 = learned_j(True)
+        check("每步都学：换向那一步被回差吃掉 → J 学小（原行为）", ok0 and j_all > -0.99 and sk0 == 0, f"J={j_all:.3f}")
+        check("同向才学：跳过换向步，J 仍是真值 −1", ok1 and abs(j_same + 1.0) < 0.01 and sk1 == 1, f"J={j_same:.3f}")
+
+        # ---- 仿真：合爪推开物块模型 + 整画面确认消除误报
+        cfg.POSES = dict(sim.SIM_POSES)
+        w, clock, cam, lift, arm2, ch = sim.make_sim(cfg, 3, 1.0, 0.0, sim.make_car(cfg, 3))
+        check("仿真推开模型默认关", cfg.SIM_CLAW_PUSH_P == 0 and w.claw_pushes == 0)
+        import sim_speed_verify as sv
+        res = {}
+        for name, over in (("off", {}), ("whole", sv.WHOLE), ("all", {**sv.ALL13, **sv.LEARN})):
+            res[name] = io_capture(lambda: res.__setitem__(name + "_r", sv.summarize(name, over, 2, 25)))
+        r0, r1, r2 = res["off_r"], res["whole_r"], res["all_r"]
+        check("仿真（推开概率 0.5）：现状确实有误报", r0["false_ok"] > 0, f"误报 {r0['false_ok']}")
+        check("仿真：整画面确认后误报 = 0，真实抓到率不降", r1["false_ok"] == 0 and r1["ok"] >= r0["ok"] - 0.02,
+              f"{r0['ok']:.0%} → {r1['ok']:.0%}")
+        check("仿真：任务 13 全开 + 任务 09 学习：误报 = 0、更快", r2["false_ok"] == 0 and r2["t"] < r0["t"],
+              f"{r0['t']:.1f}s → {r2['t']:.1f}s")
+    finally:
+        for k, v in {**saved, **saved2}.items():
+            setattr(cfg, k, v)
+        importlib.reload(cfg)
+
+
 def io_capture(fn):
     import io
     import contextlib
@@ -1224,8 +1364,12 @@ def test_sim():
         fixes = {"ARM_USB_ROBUST": True, "SEARCH_CONFIRM": True, "BASE_LIMIT_BACKUP_MM": 150}
         # 任务 09 全开（只测无底盘：任务 09 针对无底盘；有底盘 6 台车×100 次对比见 09_报告.md，差别在噪声内）
         acc = {"BASE_BACKLASH_DEG": 2.0, "BASE_MIN_STEP_DEG": 1.0, "GRASP_PROBE_MM": 3.0, "TRIM_LEARN": True}
+        # 任务 13 全开（observe 确认 + 整画面 + 去掉 carry + 动作时间缩放 + 同向才学 J）
+        sp = {"VERIFY": "observe", "VERIFY_WHOLE_FRAME": True, "VERIFY_SKIP_CARRY": True, "ARM_MOVE_SCALE": True,
+              "LEARN_SAME_DIR_ONLY": True}
         for n, seed, nc, need, extra in ((40, 31, False, 0.85, {}), (30, 33, True, 0.85, {}),
-                                         (40, 31, False, 0.85, fixes), (30, 33, True, 0.85, acc)):
+                                         (40, 31, False, 0.85, fixes), (30, 33, True, 0.85, acc),
+                                         (30, 33, True, 0.85, sp)):
             importlib.reload(cfg)
             for k, v in extra.items():
                 setattr(cfg, k, v)
@@ -1234,7 +1378,9 @@ def test_sim():
             with contextlib.redirect_stdout(buf):
                 rate = main.run_sim(n, seed, True, nc)
             line = [l for l in buf.getvalue().splitlines() if l.startswith("全部")][0]
-            check(f"{'无' if nc else '有'}底盘 {n} 次{('（打开任务 09 的开关）' if 'TRIM_LEARN' in extra else '（打开任务 02 的改进开关）') if extra else ''}，"
+            tag = ("（打开任务 13 的开关）" if "ARM_MOVE_SCALE" in extra else
+                   "（打开任务 09 的开关）" if "TRIM_LEARN" in extra else "（打开任务 02 的改进开关）") if extra else ""
+            check(f"{'无' if nc else '有'}底盘 {n} 次{tag}，"
                   f"真实抓到 ≥ {need:.0%}", rate >= need, line.split(":", 1)[1].strip())
     finally:
         importlib.reload(cfg)
@@ -1259,7 +1405,7 @@ if __name__ == "__main__":
     real_serial = devices.serial
     for t in (test_arm, test_k230, test_lift, test_chassis, test_chassis_fw, test_calib_override,
               test_step_and_guard, test_geometry, test_ghost, test_ghost_fingerprint, test_sim_factors,
-              test_bench, test_accuracy):
+              test_bench, test_accuracy, test_speed_verify):
         try:
             t()
         except Exception as e:
