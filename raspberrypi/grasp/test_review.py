@@ -9,6 +9,8 @@
   "修复"  = 这次改了代码，测试验证修好了（改之前这个测试会失败 / 卡住）
   "复现"  = 只报告没修，测试验证问题确实存在（问题修好以后要把断言反过来）
 """
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -296,6 +298,161 @@ class TestReopenAndSerialErrors(unittest.TestCase):
         self.assertIn("cam.close", log)            # K230 读线程停掉，重开时不会两个线程抢一个串口
         self.assertIn("cam.ser.close", log)
         self.assertIn("lift.ser.close", log)
+
+
+class Spy:
+    """包住仿真设备：记录调用；第 stop_at 个动作调用之前抛 KeyboardInterrupt（模拟这时按 Ctrl+C）"""
+    MOTION = {"move_to", "move_by", "start_move_by", "wait_move", "drive", "forward", "turn", "move"}
+
+    def __init__(self, dev, name, ctr, log):
+        self._dev, self._name, self._ctr, self._log = dev, name, ctr, log
+
+    def __getattr__(self, k):
+        attr = getattr(self._dev, k)
+        if not callable(attr):
+            return attr
+        if k in ("stop", "close"):
+            def w(*a, **kw):
+                self._log.append(f"{self._name}.{k}")
+                return attr(*a, **kw)
+            return w
+        if k not in self.MOTION:
+            return attr
+
+        def wrapped(*a, **kw):
+            self._ctr["n"] += 1
+            self._ctr["calls"].append(f"{self._name}.{k}")
+            if self._ctr["n"] == self._ctr["stop_at"]:
+                if k != "drive" or not hasattr(self._dev, "_sleep"):
+                    raise KeyboardInterrupt
+                # 底盘：在行驶途中（第 5 个控制周期）按 Ctrl+C
+                sl, cnt = self._dev._sleep, {"n": 0}
+
+                def sleep_then_ctrl_c(s):
+                    cnt["n"] += 1
+                    if cnt["n"] == 5:
+                        raise KeyboardInterrupt
+                    sl(s)
+                self._dev._sleep = sleep_then_ctrl_c
+            return attr(*a, **kw)
+        return wrapped
+
+
+class TestCtrlCEveryStage(unittest.TestCase):
+    """报告"异常路径"一节：每个阶段按 Ctrl+C，最后升降轴都发了急停、底盘都停了"""
+
+    def _run(self, use_chassis, stop_at, seed=3):
+        import main
+        import sim
+        old = cfg.POSES, cfg.USE_CHASSIS, cfg.LEARN_FILE
+        cfg.POSES, cfg.USE_CHASSIS = dict(sim.SIM_POSES), use_chassis
+        world, clock, cam, lift, arm, chassis = sim.make_sim(cfg, seed, 1.0, cfg.R_CAM_MM)
+        ctr, log = {"n": 0, "stop_at": stop_at, "calls": []}, []
+        devs = (cam, Spy(lift, "lift", ctr, log), Spy(arm, "arm", ctr, log),
+                Spy(chassis if use_chassis else devices.NullChassis(), "chassis", ctr, log))
+        saved = {k: getattr(main, k) for k in ("open_devices", "preflight", "ManualGuard", "RealClock", "LOG_DIR")}
+        main.open_devices = lambda c: devs
+        main.preflight = lambda *a: []
+        main.ManualGuard = _no_guard
+        main.RealClock = lambda: clock
+        main.LOG_DIR = tempfile.mkdtemp(prefix="review_")
+        sleep, main.time.sleep = main.time.sleep, (lambda s: None)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                main.run_real(once=True, step=False, force=False)
+        finally:
+            for k, v in saved.items():
+                setattr(main, k, v)
+            main.time.sleep = sleep
+            cfg.POSES, cfg.USE_CHASSIS, cfg.LEARN_FILE = old
+        return ctr, log, chassis
+
+    def test_every_stage(self):
+        for use_chassis in (False, True):
+            total = self._run(use_chassis, stop_at=10 ** 9)[0]["n"]   # 先跑一遍完整流程数一下有几个动作
+            self.assertGreater(total, 5)
+            for k in range(1, total + 1):
+                ctr, log, chassis = self._run(use_chassis, stop_at=k)
+                where = f"{'有' if use_chassis else '无'}底盘，第 {k} 个动作 {ctr['calls'][k - 1]} 时按 Ctrl+C"
+                self.assertIn("lift.stop", log, where)
+                self.assertIn("chassis.stop", log, where)
+                if use_chassis and hasattr(chassis, "cmd"):
+                    self.assertEqual(tuple(chassis.cmd), (0, 0), where)
+
+
+class TestReportedNotFixed(unittest.TestCase):
+    """只报告、没有修的问题（断言的是"问题存在"；修好以后把断言反过来）"""
+
+    def test_ghost_fingerprint_learns_real_block_when_base_has_deadband(self):
+        """[会抓错-1]：底座死区大时 GHOST_CHECK 把真物块判成 ghost，GHOST_FINGERPRINT 再把它记成指纹、以后一直过滤"""
+        import sim
+        from task import GraspTask
+        names = ("POSES", "USE_CHASSIS", "R_CAM_MM", "BASE_DIR", "SIM_SERVO_DEADBAND_US", "GHOST_FINGERPRINT")
+        old = {k: getattr(cfg, k) for k in names}
+        old_j0 = cfg.AXES["x_deg"]["j0"]
+        try:
+            # 真机标定值：相机在底座转轴上、底座灵敏度 −0.6、底座方向 −1；死区 50us ≈ 4.5°（"< 5° 转动不到位"）
+            cfg.POSES, cfg.USE_CHASSIS, cfg.R_CAM_MM, cfg.BASE_DIR = dict(sim.SIM_POSES), False, 0.0, -1
+            cfg.AXES["x_deg"]["j0"] = -0.6
+            cfg.SIM_SERVO_DEADBAND_US, cfg.GHOST_FINGERPRINT = 50, True
+            d = tempfile.mkdtemp(prefix="review_ghost_")
+            car = sim.make_car(cfg, 1)
+            task, res = None, []
+            for i in range(20):
+                world, clock, cam, lift, arm, ch = sim.make_sim(cfg, 1000 + i, 1.0, 0.0, car)
+                if task is None:
+                    task = GraspTask(cfg, clock, cam, lift, arm, ch, log_dir=d, verbose=False)
+                else:
+                    task.clock, task.cam, task.lift, task.arm, task.chassis = clock, cam, lift, arm, ch
+                    task.base_deg, task._base_sent, task._base_dir = 0.0, None, 0
+                res.append(task.run_once()["result"])
+        finally:
+            for k, v in old.items():
+                setattr(cfg, k, v)
+            cfg.AXES["x_deg"]["j0"] = old_j0
+        # 仿真里根本没有"爪子被识别成物块"，所有 ghost 都是误判；记下的指纹全是真物块的位置
+        self.assertGreater(res.count("ghost"), 0, res)
+        self.assertGreater(len(task.ghosts), 0)
+        self.assertGreater(sum(g["seen"] for g in task.ghosts), 0, "真物块被指纹过滤掉了")
+
+    def test_reach_pose_divides_by_zero_when_near_equals_far(self):
+        """[报错退出-2]（概率很小，没修）：REACH_NEAR_D == REACH_FAR_D 时 reach_pose 除零"""
+        from task import GraspTask
+        t = GraspTask.__new__(GraspTask)
+        t.cfg = types.SimpleNamespace(POSES={"reach_near": {3: 1}, "reach_far": {3: 2}},
+                                      REACH_NEAR_D=180.0, REACH_FAR_D=180.0)
+        with self.assertRaises(ZeroDivisionError):
+            t.reach_pose(180.0)
+
+    def test_partial_tol_in_calib_json_crashes(self):
+        """[报错退出-3]（没修）：calib.json 里 TOL 只写一部分轴会整体替换，缺的轴 KeyError"""
+        import json
+        import subprocess
+        path = tempfile.mktemp(suffix=".json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"TOL": {"x_deg": 2.0}}, f)
+        env = dict(os.environ, GRASP_CALIB_FILE=path)
+        env.pop("GRASP_IGNORE_CALIB", None)
+        code = "import config as c; print(sorted(c.TOL))"
+        out = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env, capture_output=True, text=True)
+        os.remove(path)
+        self.assertEqual(out.stdout.strip(), "['x_deg']")       # y / d 没了 → in_tol() 里 KeyError
+
+    def test_lift_clamp_makes_observe_check_lower(self):
+        """[会抓错-3]（没修）：升降轴离上限不到 5cm 时，抬升被截断，观察确认却按满 5cm 往下降"""
+
+        class S(LineSerial):
+            def write(self, b):
+                t = b.decode().split()
+                if t and t[0] == "A":
+                    self.replies += [f"OK GO {t[1]}", f"DONE {t[1]}"]
+
+        install_fake(S([]))
+        lift = devices.Lift("x", 115200, 44.0)
+        lift.pos = 42.0                                     # 抓取时的高度
+        up = lift.move_by(5.0)                              # grasp()：合爪后上抬 → 截到 44
+        down = lift.move_by(-5.0)                           # _observe_check()：降回"抓取时的高度"
+        self.assertEqual((up, down), (44.0, 39.0))          # 比抓取时低 3cm（≈ 物块在画面里偏 18mm）
 
 
 def wheeltec_fb(vx=0, volt_mv=25000, flag=0):
