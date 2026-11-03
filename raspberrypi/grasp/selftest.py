@@ -722,6 +722,12 @@ def test_ghost():
         t = GraspTask(cfg, Clock(), GhostCam(0, g["y"] + 30, g["d"]), lift, Arm(), None, verbose=False, learn=False)
         ok, m, n = t.align(t.cam.m)
         check("升降轴到最低点还要往下 → 判定够不着", not ok and t._abort == "lift_limit" and not lift.moves)
+        # 升降轴在最低点、剩余误差在容差内（地上的物块）→ 按已对准处理，去抓
+        lift = Lift(0.0)
+        t = GraspTask(cfg, Clock(), GhostCam(math.tan(math.radians(g["x_deg"])) * g["d"], g["y"] + 10, g["d"]),
+                      lift, Arm(), None, verbose=False, learn=False)
+        ok, m, n = t.align(t.cam.m)
+        check("升降轴在最低点、剩余 10mm（容差 15mm 内）→ 按已对准处理", ok and not lift.moves, f"ok={ok} abort={t._abort}")
     finally:
         cfg.USE_CHASSIS = saved
 

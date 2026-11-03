@@ -205,6 +205,15 @@ class GraspTask:
                 return False, None, step
             goal = self.goal_for(m)
             e = m.err(goal)
+            # 升降轴已经在最低（或最高）点、还想往外走一点：误差在爪子能兜住的范围内就算对准了高度
+            # （地上的物块只有升降轴在 0cm 时才够得着，读数稍有波动就会想"再往下一点"）
+            pos0 = getattr(self.lift, "pos", None)
+            if pos0 is not None and abs(e["y"]) <= c.LIFT_LIMIT_SLACK_MM and (
+                    (pos0 <= 0.05 and e["y"] > 0) or (pos0 >= c.LIFT_MAX_CM - 0.05 and e["y"] < 0)):
+                if abs(e["y"]) > c.TOL["y"]:
+                    self.say(f"对准：升降轴已到{'最低' if e['y'] > 0 else '最高'}，剩余 y={e['y']:+.0f}mm 在容差"
+                             f" {c.LIFT_LIMIT_SLACK_MM:.0f}mm 内，按已对准处理")
+                e = dict(e, y=0.0)
             if self.in_tol(e):
                 return True, m, step
 

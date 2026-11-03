@@ -197,6 +197,8 @@ REACH_RANGE_OK = True     # 深度超出这个范围时仍尝试（姿态截断�
 GOAL_FAR = None
 # 对准时动了执行器、读数却几乎不变（< 30% 预期），连续 2 次 → 判定 K230 识别到的是机械臂自己，停止
 GHOST_CHECK = True
+# 升降轴到最低/最高点后，剩余高度误差（K230 读数 mm）不超过这个值就照样去抓（爪子张开时上下能兜住一点）
+LIFT_LIMIT_SLACK_MM = 15.0
 # 左右微调（度，底座右转为正）：对准后爪子落点系统性偏右就填负数，往左补。用 `calib.py trim <偏右毫米>` 设置
 GRASP_BASE_TRIM_DEG = 0.0
 REACH_MARGIN_MM = 25      # 没有底盘时：物块深度超出 [REACH_NEAR_D, REACH_FAR_D]（或只标了一个姿态时 GOAL 深度）±这么多就不抓
@@ -236,7 +238,7 @@ CALIB_FILE = _os.environ.get("GRASP_CALIB_FILE") or     _os.path.join(_os.path.d
 CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "GOAL", "TOL", "R_CAM_MM", "BASE_DIR", "BASE_CENTER", "BASE_US_PER_DEG", "CLAW_OPEN", "CLAW_CLOSE",
     "REACH_NEAR_D", "REACH_FAR_D", "POSES_CALIBRATED", "ACK_MIN_RADIUS_MM", "K230_ROTATE", "LIFT_MAX_CM",
-    "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "SEARCH_LOOK_FIRST", "REACH_MARGIN_MM", "GOAL_FAR", "GHOST_CHECK", "OBSERVE_CLAW", "GRASP_BASE_TRIM_DEG", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
+    "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "SEARCH_LOOK_FIRST", "REACH_MARGIN_MM", "GOAL_FAR", "GHOST_CHECK", "LIFT_LIMIT_SLACK_MM", "OBSERVE_CLAW", "GRASP_BASE_TRIM_DEG", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
     "ARM_SLOW_MS", "STEP_ALPHA",
     "CHASSIS_STOP_MODEL", "CHASSIS_CMD_LATENCY_S", "CHASSIS_PI_TAU_S", "CHASSIS_REF_VOLTAGE_V",
     "CHASSIS_CMD_TTL_S", "CHASSIS_YAW_TRIM_DEG_PER_M",
