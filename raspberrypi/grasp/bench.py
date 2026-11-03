@@ -662,6 +662,7 @@ def main(argv=None):
         print("启动：", " ".join(sys.argv), " calib.json 覆盖：", sorted(cfg.CALIB_LOADED))
         rig = RealRig(a.step, a.force)
         path = a.csv
+        grasp_main.install_stop_signals()      # systemctl stop / SSH 断开也走下面的停车流程
     from devices import DeviceResetError
     try:
         if not rig.open():

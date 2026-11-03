@@ -165,5 +165,78 @@ class TestLiftReset(unittest.TestCase):
         self.assertEqual(h.opens, 2, "普通设备错误仍然重开设备再来（原行为）")
 
 
+CHASSIS_SCRIPT = r'''
+import os, sys, time, types
+sys.path.insert(0, {here!r})
+os.environ["GRASP_IGNORE_CALIB"] = "1"
+import devices, main
+out = open({out!r}, "ab", buffering=0)
+
+class S:
+    def __init__(self, *a, **k): pass
+    def write(self, b): out.write(bytes(b))
+    def flush(self): pass
+    def read(self, n):
+        time.sleep(0.02)
+        return b""
+    def close(self): pass
+
+devices.serial = types.SimpleNamespace(Serial=S, SerialException=OSError)
+ch = devices.WheeltecChassis("x", 115200, 100, 600, True, None)
+if {install}:
+    main.install_stop_signals()
+print("ready", flush=True)
+try:
+    ch.drive(3000)            # 没有回传：按时间走 30 秒
+finally:
+    main.close_devices([ch])
+'''
+
+
+def last_chassis_frame(path):
+    with open(path, "rb") as fh:
+        data = fh.read()
+    i = data.rfind(b"\x7B")
+    f = data[i:i + 11]
+    return int.from_bytes(f[3:5], "big", signed=True), int.from_bytes(f[7:9], "big", signed=True)
+
+
+class TestStopSignals(unittest.TestCase):
+    """报告 [伤硬件-2]（修复）：systemctl stop / SSH 断开时底盘最后一帧不是停车帧"""
+
+    def _run(self, sig, install):
+        import signal
+        import subprocess
+        out = tempfile.mktemp(suffix=".bin")
+        code = CHASSIS_SCRIPT.format(here=HERE, out=out, install=install)
+        p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True)
+        try:
+            self.assertEqual(p.stdout.readline().strip(), "ready")
+            time.sleep(0.4)                     # 让它开起来（发送线程在发 vx=100）
+            p.send_signal(getattr(signal, sig))
+            p.wait(timeout=10)
+        finally:
+            if p.poll() is None:
+                p.kill()
+            p.stdout.close()
+            p.stderr.close()
+        try:
+            return last_chassis_frame(out)
+        finally:
+            os.remove(out)
+
+    def test_sigterm_sends_stop_frame(self):
+        self.assertEqual(self._run("SIGTERM", True), (0, 0))
+
+    def test_sighup_sends_stop_frame(self):
+        self.assertEqual(self._run("SIGHUP", True), (0, 0))
+
+    def test_without_handler_last_frame_is_moving(self):
+        # 复现原来的危险：不装信号处理时进程被直接杀掉，最后发出去的是 vx=100 的帧，固件会一直按它跑
+        vx, wz = self._run("SIGTERM", False)
+        self.assertGreater(vx, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

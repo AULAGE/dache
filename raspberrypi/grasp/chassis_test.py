@@ -27,7 +27,7 @@ sys.path.insert(0, HERE)
 
 import config as cfg  # noqa: E402
 from devices import DeviceError, WheeltecChassis  # noqa: E402
-from main import chassis_options  # noqa: E402
+from main import chassis_options, install_stop_signals  # noqa: E402
 
 
 def manual_running():
@@ -115,6 +115,7 @@ def main():
     ap.add_argument("--fresh", action="store_true", help="不读上次学到的 τ，从默认值开始学")
     ap.add_argument("--timeout-check", action="store_true", help="验证固件有没有串口超时（轮子必须离地）")
     a = ap.parse_args()
+    install_stop_signals()          # SSH 断开 / kill 时也走 finally 停车（固件没有串口超时）
 
     if manual_running():
         print(f"手柄程序 {cfg.MANUAL_PROCESS} 在运行，会抢底盘串口。先停掉它。")

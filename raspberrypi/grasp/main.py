@@ -179,6 +179,21 @@ class Tee:
         self.out.flush()
 
 
+def install_stop_signals():
+    """
+    systemctl stop（SIGTERM）、SSH 断开（SIGHUP）默认直接结束进程，不走 finally / atexit：
+    底盘固件没有串口超时，最后一帧速度会一直保持；升降轴也收不到急停。
+    改成和 Ctrl+C 一样抛 KeyboardInterrupt，走原来的停车流程（任务 17 审查）
+    """
+    import signal
+
+    def _stop(signum, frame):
+        raise KeyboardInterrupt(f"收到信号 {signum}")
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _stop)
+
+
 def manual_running():
     # 直接调用 pgrep（不经过 shell），否则 shell 自己的命令行里含有进程名，会误报
     return subprocess.run(["pgrep", "-f", cfg.MANUAL_PROCESS], capture_output=True).returncode == 0
@@ -387,4 +402,5 @@ if __name__ == "__main__":
             cfg.USE_CHASSIS = False
         sys.stdout = Tee(os.path.join(LOG_DIR, time.strftime("run_%Y%m%d_%H%M%S.log")))
         print("启动：", " ".join(sys.argv), " calib.json 覆盖：", sorted(cfg.CALIB_LOADED))
+        install_stop_signals()
         run_real(a.once, a.step, a.force, a.record)
