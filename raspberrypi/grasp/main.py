@@ -279,7 +279,18 @@ def get_recorder(clock, cam, enable=False):
         import atexit
         from recorder import Recorder
         path = os.path.join(LOG_DIR, time.strftime("record_%Y%m%d_%H%M%S.jsonl"))
-        _RECORDER = Recorder(path, clock, cam)
+        sync = None
+        port = getattr(cfg, "K230_SYNC_PORT", None)
+        if port:                         # 任务 12：给 K230 发同步标记（默认 None = 不发）
+            from recorder import SyncSender, open_sync_writer
+            try:
+                w = open_sync_writer(port, cfg.BAUD["k230"], get_cam=lambda: _RECORDER.cam if _RECORDER else None,
+                                     k230_port=cfg.PORTS["k230"])
+                sync = SyncSender(w, clock, getattr(cfg, "K230_SYNC_PERIOD_S", 1.0))
+                print("同步标记发到", port)
+            except Exception as e:
+                print("⚠ 同步串口打不开，不发同步标记：", e)
+        _RECORDER = Recorder(path, clock, cam, sync=sync)
         _RECORDER.write("calib", keys=sorted(getattr(cfg, "CALIB_LOADED", [])))
         atexit.register(_RECORDER.close)
         print("记录动作和 K230 数据到", path)

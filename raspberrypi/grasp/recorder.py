@@ -20,6 +20,9 @@
                   "ret":返回值, "state":执行后状态（机械臂各舵机脉宽 / 升降轴高度）, "err":异常（有的话）}
   {"ev":"say",    "t":..., "msg":任务打印的一行}             用来切分阶段（对准 / 抓取 / 确认）
   {"ev":"episode","t":..., "row":{...}}                       一次抓取的结果（同 episodes.csv）
+  {"ev":"sync",   "t":发出时刻, "seq":序号, "pi_t":"发出去的时间原文", "why":"tick/pre/post"}
+                  只在配置了 config.K230_SYNC_PORT 时有（任务 12）：发给 K230 的同步标记 "SYNC <seq> <pi_t>"；
+                  此时 cmd 事件多一个 "sync":[命令前的序号, 命令后的序号]。离线对齐见 research/align_k230_log.py
 """
 import csv
 import json
@@ -45,12 +48,63 @@ def _jsonable(v):
     return str(v)
 
 
+class SyncSender:
+    """
+    给 K230 发同步标记（任务 12）："SYNC <序号> <t>\n"，t = 树莓派单调时钟（和 jsonl 里的 t 是同一个时钟），
+    保留 4 位小数。write 是一个 callable(bytes)；发失败只计数，不抛异常（不能影响抓取）
+    """
+
+    def __init__(self, write, clock, period_s=1.0):
+        self._write = write
+        self.clock = clock
+        self.period_s = period_s
+        self.seq = 0
+        self.last_t = -1e18
+        self.errors = 0
+        self._lock = threading.Lock()
+
+    def send(self):
+        """发一条，返回 (序号, 发出时刻, 时间原文, 错误或 None)"""
+        with self._lock:
+            self.seq += 1
+            t = self.clock.now()
+            txt = f"{t:.4f}"
+            try:
+                self._write(f"SYNC {self.seq} {txt}\n".encode("ascii"))
+            except Exception as e:
+                self.errors += 1
+                return self.seq, t, txt, f"{type(e).__name__}: {e}"
+            self.last_t = t
+            return self.seq, t, txt, None
+
+    def due(self):
+        return bool(self.period_s) and self.clock.now() - self.last_t >= self.period_s
+
+
+def open_sync_writer(port, baud, get_cam=None, k230_port=None):
+    """
+    同步串口的发送函数。port 和 K230 的接收串口是同一个（真机：/dev/ttyAMA3 的 TX = GPIO4）时，
+    复用 K230 对象已经打开的 serial（get_cam() 每次取最新的，设备重开后也能用）；否则单独打开
+    """
+    if port == "k230" or (k230_port and port == k230_port):
+        def write(b):
+            ser = getattr(get_cam() if get_cam else None, "ser", None)
+            if ser is None:
+                raise IOError("K230 串口没打开")
+            ser.write(b)
+        return write
+    import serial
+    ser = serial.Serial(port, baud, timeout=0, write_timeout=0.1)
+    return ser.write
+
+
 class Recorder:
-    def __init__(self, path, clock, cam=None, poll_s=0.05):
+    def __init__(self, path, clock, cam=None, poll_s=0.05, sync=None):
         self.path = path
         self.clock = clock
         self.cam = cam
         self.poll_s = poll_s
+        self.sync = sync                 # SyncSender 或 None（默认：不发同步标记，记录内容和原来一样）
         self._lock = threading.Lock()
         self._poll_lock = threading.Lock()
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -111,6 +165,20 @@ class Recorder:
             if self._last_hb is not None and hb > self._last_hb:
                 self.write("hb", n=hb - self._last_hb)
             self._last_hb = hb
+        if self.sync is not None and self.sync.due():
+            self.sync_mark("tick")
+
+    def sync_mark(self, why):
+        """发一条同步标记并记一条 sync 事件；没配置同步串口时什么也不做，返回 None"""
+        s = self.sync
+        if s is None:
+            return None
+        seq, t, txt, err = s.send()
+        data = {"seq": seq, "pi_t": txt, "why": why}
+        if err:
+            data["err"] = err
+        self.write("sync", t=t, **data)
+        return None if err else seq
 
     def _poll(self):
         while self._run:
@@ -151,6 +219,7 @@ class RecordProxy:
 
         def wrapped(*a, **kw):
             self._rec.poll_once()            # 先把动作之前收到的帧写进去，保证事件按时间顺序
+            sync_pre = self._rec.sync_mark("pre")     # 同步标记（没配置时为 None，什么也不发）
             t0 = self._rec.clock.now()
             err = None
             ret = None
@@ -172,6 +241,8 @@ class RecordProxy:
                         "t_end": self._rec.clock.now(), "state": state}
                 if err:
                     data["err"] = err
+                if self._rec.sync is not None:
+                    data["sync"] = [sync_pre, self._rec.sync_mark("post")]
                 self._rec.poll_once()
                 self._rec.write("cmd", t=t0, **data)
                 self._rec.flush()

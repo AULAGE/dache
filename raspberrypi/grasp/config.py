@@ -79,6 +79,13 @@ FOV_Y_DEG = 25
 K230_FPS = 7              # 实测约 7 帧/秒（--check 时 2 秒 14 帧），只用于仿真
 SIM_MAX_DETECT_MM = 900   # 仿真：超过这个距离认为 24mm 的物块太小、识别不出来
 
+# —— 同步标记（任务 12，论文数据集）：--record 时给 K230 发 "SYNC <序号> <树莓派时间>"，K230 存图时据此对齐时钟 ——
+# 接线：树莓派 GPIO4（物理脚 7）= uart3 TX → K230 UART1 RX（k230_sdcard/main.py 里 FPIOA 4 号脚）。见 docs/cloud_tasks/results/12_报告.md
+# None = 不发（默认，原行为）。uart3 已经用来收 K230 的帧，同步走同一个口的发送方向，所以真机填 "/dev/ttyAMA3"
+#   （和 PORTS["k230"] 相同时直接复用 K230 已经打开的串口，不会再开一次）。波特率用 BAUD["k230"]。
+K230_SYNC_PORT = None
+K230_SYNC_PERIOD_S = 1.0      # 除了每条动作命令前后各发一次，空闲时每隔这么久也发一次
+
 # ======================= 仿真真实度（只影响 sim.py，真机不用；任务 02） =======================
 # 每一项都可以单独关掉做对比（python3 sim_compare.py 逐项对比）。标"估计"的是没有实测、按常识给的值
 SIM_K230_TRACKER = True        # 1 逐帧模拟 K230 跟踪器（中值+EMA 滞后、丢帧时预测但不发、2 帧确认）
@@ -286,6 +293,7 @@ CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "BASE_BACKLASH_DEG", "BASE_APPROACH_DIR", "BASE_MIN_STEP_DEG", "GRASP_PROBE_MM", "GRASP_PROBE_FIRST",
     "TRIM_LEARN", "TRIM_LEARN_RATE", "TRIM_MAX_DEG", "TRIM_LEARN_EDGES", "REACH_MID_D", "GOAL_MID",
     "GHOST_FINGERPRINT", "GHOST_FP_TOL", "GHOST_FP_MIN_HITS", "GHOST_FP_MAX",
+    "K230_SYNC_PORT", "K230_SYNC_PERIOD_S",
 }
 
 

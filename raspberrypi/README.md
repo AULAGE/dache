@@ -165,6 +165,10 @@ python3 test_recorder.py                          # 离线测试
 ```
 - 建议从现在起每次真机运行都加 `--record`：调试、比赛训练都在积累数据集（见 `docs/论文研究方案.md`）
 - 文件约每分钟几百 KB；`logs/` 不在仓库里，定期拷到电脑上
+- **带图像（任务 12，默认关）**：接好同步线（树莓派 GPIO4 → K230 UART1 RX），`calib.json` 里加 `"K230_SYNC_PORT": "/dev/ttyAMA3"`，
+  K230 程序里设 `IMAGE_LOG_ENABLE = True`。K230 把图存到 SD 卡 `/sdcard/datalog/sNNNN/`，树莓派每秒和每条命令前后发 `SYNC` 标记。
+  事后拷出 SD 卡目录：`python3 research/align_k230_log.py --record logs/record_*.jsonl --k230 <sNNNN目录> -o dataset.csv`。
+  接线、目录结构、字段说明见 `docs/cloud_tasks/results/12_报告.md`
 
 ## 其他用法
 ```bash

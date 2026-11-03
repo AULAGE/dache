@@ -743,6 +743,420 @@ class TestIgnoreRegions(unittest.TestCase):
         self.assertIsNone(m.IgnoreCalib(FW, FH, 0).suggestion())
 
 
+# ====================================================================== 存图 + 同步标记（任务 12）
+class _FakeClock:
+    def __init__(self, t=0):
+        self.t = t
+
+    def now(self):
+        return self.t
+
+
+class _FakeRxUART:
+    """只有 any/read 的假串口：chunks 依次是每次 poll 时串口里已经到了的字节"""
+    def __init__(self, chunks=()):
+        self.pending = list(chunks)
+        self.cur = b""
+        self.sent = []
+
+    def feed(self, b):
+        self.cur += b
+
+    def any(self):
+        if not self.cur and self.pending:
+            self.cur = self.pending.pop(0)
+        return len(self.cur)
+
+    def read(self, n):
+        b, self.cur = self.cur[:n], self.cur[n:]
+        return b
+
+    def write(self, b):
+        self.sent.append(bytes(b))
+        return len(b)
+
+
+class _FakeFS:
+    """包住真 os，只替换 statvfs（模拟 SD 卡剩余空间）"""
+    def __init__(self, free_bytes):
+        self.free = free_bytes
+        self.checks = 0
+
+    def __getattr__(self, k):
+        return getattr(os, k)
+
+    def statvfs(self, path):
+        self.checks += 1
+        return (4096, 4096, 1 << 20, self.free // 4096, self.free // 4096, 0, 0, 0, 0, 255)
+
+
+def _read_csv(path):
+    import csv
+    with open(path, encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+class TestDataLog(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="k230_dlog_")
+        self.m = k230_stub.load_main()
+        self.img = synth.render(640, 360, 120, 10.0)
+
+    def tearDown(self):
+        import shutil
+        self.m._send_hook = None
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def raw_only(self):
+        """板子上的 JPEG 接口在 CPython 里没有：只留原始格式（numpy.tobytes 真能写）"""
+        return [c for c in self.m.DataLogger(self.tmp)._candidates() if c[0] == "raw"]
+
+    def test_defaults_off(self):
+        """默认关闭：没有发送钩子，发帧字节和原来一样"""
+        m = self.m
+        self.assertFalse(m.IMAGE_LOG_ENABLE)
+        self.assertIsNone(m._send_hook)
+        self.assertEqual(m.IMAGE_LOG_EVERY, 1)
+        self.assertEqual((FW // m.IMAGE_LOG_STEP, FH // m.IMAGE_LOG_STEP), (320, 180))
+        m.uart.sent.clear()
+        m.send_position_via_uart(10, -20, 150, verbose=False)
+        self.assertEqual(m.uart.sent[-1], bytes([0xAA, 0x55, 0x00, 0x0A, 0xFF, 0xEC, 0x00, 0x96,
+                                                  m.crc8(bytes([0xAA, 0x55, 0x00, 0x0A, 0xFF, 0xEC, 0x00, 0x96])),
+                                                  0x0D]))
+
+    def test_parse_sync_line(self):
+        p = self.m.parse_sync_line
+        self.assertEqual(p(b"SYNC 12 3456.7890"), (12, "3456.7890"))
+        self.assertEqual(p(b"SYNC 3 17.5\r"), (3, "17.5"))
+        for bad in (b"", b"SYNC", b"SYNC x 1.0", b"SYNC 1 abc", b"HELLO 1 2", b"SYNC 1 2 3", b"\xff\xfe"):
+            self.assertIsNone(p(bad), bad)
+
+    def test_sync_rx_split_and_interval(self):
+        """同步行被拆成几段到达、中间夹乱码；返回的时间区间 = (上次 poll, 这次 poll]"""
+        clk = _FakeClock(1000)
+        u = _FakeRxUART()
+        rx = self.m.SyncRx(u, clk)
+        clk.t = 2000
+        u.feed(b"SYN")
+        self.assertEqual(rx.poll(), [])
+        clk.t = 3000
+        u.feed(b"C 1 10.0000\nxx garbage\nSYNC 2 11.")
+        self.assertEqual(rx.poll(), [(1, "10.0000", 2000, 3000)])
+        self.assertEqual(rx.junk, 1)
+        clk.t = 3500
+        self.assertEqual(rx.poll(), [])
+        clk.t = 4200
+        u.feed(b"0000\n")
+        self.assertEqual(rx.poll(), [(2, "11.0000", 3500, 4200)])
+        u.feed(b"z" * 400)                        # 一直没有换行：丢掉缓存，不会越积越多
+        rx.poll()
+        self.assertEqual(rx.buf, b"")
+        self.assertEqual(rx.count, 2)
+
+    def test_sync_rx_without_any(self):
+        """串口对象没有 any()（不能不阻塞地读）就不接收，也不会去调用 read 卡住主循环"""
+        class NoAny:
+            def read(self, n):
+                raise AssertionError("不该调用")
+        rx = self.m.SyncRx(NoAny(), _FakeClock())
+        self.assertFalse(rx.ok)
+        self.assertEqual(rx.poll(), [])
+
+    def test_mono_us_wraps(self):
+        """ticks_us 按 2^30 回绕后，MonoUs 仍单调递增、差值正确"""
+        period = 1 << 30
+        seq = [period - 300, period - 100, 50, 400, 400]
+        it = iter(seq)
+        c = self.m.MonoUs(ticks=lambda: next(it))
+        vals = [c.now() for _ in range(4)]
+        self.assertEqual(vals, [200, 350, 700, 700])
+
+    def test_session_dirs(self):
+        m = self.m
+        self.assertEqual(m.next_session_name([]), "s0001")
+        self.assertEqual(m.next_session_name(["s0003", "s0010", "abc", "s12", "sxxxx"]), "s0011")
+        a = m.DataLogger(self.tmp + "/datalog")
+        self.assertTrue(a.start())
+        a.close()
+        b = m.DataLogger(self.tmp + "/datalog")
+        self.assertTrue(b.start())
+        b.close()
+        self.assertEqual(sorted(os.listdir(self.tmp + "/datalog")), ["s0001", "s0002"])
+        with open(self.tmp + "/datalog/s0001/info.txt", encoding="utf-8") as f:
+            info = f.read()
+        self.assertIn("img_w=320", info)
+        self.assertIn("img_h=180", info)
+
+    def test_frames_csv_and_images(self):
+        """frames.csv：拍照时刻、全部检测框（含忽略区域里的）、跟踪器状态、本帧发出去的帧；每 2 帧存一张图"""
+        m = self.m
+        m.IMAGE_LOG_EVERY = 2
+        clk = _FakeClock(0)
+        u = _FakeRxUART()
+        dl = m.DataLogger(self.tmp, uart_obj=u, labels=["red"], clock=clk, encoders=self.raw_only())
+        self.assertTrue(dl.start())
+        self.assertIsNotNone(m._send_hook)
+        rects = m.ignore_rects_raw(FW, FH)
+        claw = m.ignore_region_to_raw(m.IGNORE_REGIONS[0], FW, FH)
+        ccx, ccy = (claw[0] + claw[2]) / 2, (claw[1] + claw[3]) / 2
+        t = m.Tracker()
+        for k in range(4):
+            clk.t = 1000 + k * 140000             # 微秒：每帧 140ms
+            dl.frame_begin(k)
+            dets = [det(box_at(640, 360, 120), 0.9), det(box_at(ccx, ccy, 40), 0.5)]
+            d, matched = t.select(m.filter_ignored(list(dets), rects)[0], 0.35, 0.19, lambda bb: None)
+            t.update(d, matched, [d[2], d[3], d[4], d[5]], None, False, None, 140)
+            clk.t += 30000
+            if k == 2:
+                m.send_position_via_uart(1.4, -2.6, 150.2, verbose=False)
+            elif k == 3:
+                m.send_position_via_uart(0, 0, 0, verbose=False)
+            if k == 1:
+                u.feed(b"SYNC 5 123.4567\n")
+            clk.t += 5000
+            dl.frame_end(k, self.img, None, dets, rects, t)
+        dl.close()
+        self.assertIsNone(m._send_hook)
+        rows = _read_csv(dl.dir + "/frames.csv")
+        self.assertEqual([r["frame"] for r in rows], ["0", "1", "2", "3"])
+        self.assertEqual(float(rows[1]["t_ms"]), (1000 + 140000) / 1000.0)
+        self.assertEqual([r["img"] for r in rows], ["img/0000/000000.rgb", "", "img/0000/000002.rgb", ""])
+        self.assertEqual([r["trk"] for r in rows], ["tent", "lock", "lock", "lock"])
+        self.assertEqual(rows[0]["n_det"], "2")
+        dd = rows[0]["dets"].split("|")
+        self.assertEqual(dd[0].split(":")[-1], "0")
+        self.assertEqual(dd[1].split(":")[-1], "1")          # 爪子脚：标了 ign=1，但照样记下来
+        self.assertEqual((rows[2]["sent"], rows[2]["sx"], rows[2]["sy"], rows[2]["sd"]), ("pos", "1", "-3", "150"))
+        self.assertEqual(float(rows[2]["t_send_ms"]), (1000 + 2 * 140000 + 30000) / 1000.0)
+        self.assertEqual(rows[3]["sent"], "hb")
+        self.assertEqual(rows[0]["sent"], "")
+        with open(dl.dir + "/img/0000/000000.rgb", "rb") as f:
+            raw = f.read()
+        self.assertEqual(len(raw), 3 * 320 * 180)
+        small = np.frombuffer(raw, dtype=np.uint8).reshape(3, 180, 320)
+        self.assertTrue(np.array_equal(small, self.img[:, ::4, ::4]))
+        syn = _read_csv(dl.dir + "/sync.csv")
+        self.assertEqual(len(syn), 1)
+        self.assertEqual((syn[0]["seq"], syn[0]["pi_t"], syn[0]["frame"]), ("5", "123.4567", "1"))
+        self.assertEqual(float(syn[0]["k230_ms_prev"]), 141.0)
+        self.assertEqual(float(syn[0]["k230_ms"]), 176.0)
+
+    def test_raw2png_roundtrip(self):
+        """退回原始格式时，tools/raw2png.py 能把 .rgb 转回 PNG，像素不变"""
+        import zlib
+        sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
+        import raw2png
+        small = self.img[:, ::4, ::4].copy()
+        png = raw2png.planar_to_png_bytes(small.tobytes(), 320, 180)
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        i = png.index(b"IDAT")
+        n = int.from_bytes(png[i - 4:i], "big")
+        rows = zlib.decompress(png[i + 4:i + 4 + n])
+        y = 37
+        line = rows[y * (1 + 960) + 1:(y + 1) * (1 + 960)]
+        self.assertEqual(list(line[3 * 100:3 * 100 + 3]), [int(v) for v in small[:, y, 100]])
+
+    def test_encoder_selection(self):
+        """第一种编码方式不可用就试下一种，第一个成功的固定下来；以后失败计数，连续 5 次停存图"""
+        m = self.m
+        calls = []
+
+        def bad(p, a, c):
+            calls.append("bad")
+            raise ValueError("板子上没有这个接口")
+
+        state = {"fail": False}
+
+        def good(p, a, c):
+            calls.append("good")
+            if state["fail"]:
+                raise OSError("SD 卡写失败")
+            with open(p, "wb") as f:
+                f.write(b"\xff\xd8fakejpeg")
+            return 10
+
+        dl = m.DataLogger(self.tmp, encoders=[("bad", "jpg", bad), ("good", "jpg", good)])
+        self.assertTrue(dl.start())
+        self.assertEqual(dl.save_image(0, self.img, None), "img/0000/000000.jpg")
+        self.assertEqual(dl.method, "good")
+        self.assertEqual(calls, ["bad", "good"])
+        calls.clear()
+        self.assertEqual(dl.save_image(1001, self.img, None), "img/0001/001001.jpg")
+        self.assertEqual(calls, ["good"])                    # 选定后不再试不可用的
+        state["fail"] = True
+        for k in range(5):
+            self.assertEqual(dl.save_image(1002 + k, self.img, None), "")
+        self.assertFalse(dl.images_on)
+        self.assertTrue(dl.csv_on)                           # frames.csv 照写
+        dl.frame_end(2000, self.img, None, [], [], m.Tracker())
+        dl.close()
+        rows = _read_csv(dl.dir + "/frames.csv")
+        self.assertEqual((rows[-1]["frame"], rows[-1]["img"], rows[-1]["trk"]), ("2000", "", "none"))
+
+    def test_board_jpeg_paths_with_fake_image(self):
+        """用假的 CanMV image 模块走一遍板子上的 JPEG 路径：AI 图软件缩小 -> RGBP888 -> to_rgb888 -> compress"""
+        m = self.m
+        seen = {}
+
+        class Jpg:
+            def __init__(self, n):
+                self.n = n
+
+            def bytearray(self):
+                return bytearray(b"\xff\xd8" + b"j" * (self.n - 2) + b"\x00" * 50)
+
+            def size(self):
+                return self.n
+
+        class Img:
+            def __init__(self, w, h, fmt, data=None):
+                seen["shape"] = (w, h, fmt, tuple(data.shape))
+                seen["data"] = np.array(data)
+
+            def to_rgb888(self):
+                return self
+
+            def compress(self, quality):
+                seen["q"] = quality
+                return Jpg(1234)
+
+        class FakeImageMod:
+            RGBP888 = 99
+            Image = Img
+        m.image = FakeImageMod
+        dl = m.DataLogger(self.tmp)
+        dl.start()
+        rel = dl.save_image(7, self.img, None)
+        dl.close()
+        self.assertEqual(rel, "img/0000/000007.jpg")
+        self.assertEqual(dl.method, "rgbp888.to_rgb888.jpeg")
+        self.assertEqual(seen["shape"], (320, 180, 99, (3, 180, 320)))
+        self.assertTrue(np.array_equal(seen["data"], self.img[:, ::4, ::4]))
+        self.assertEqual(seen["q"], m.IMAGE_LOG_QUALITY)
+        self.assertEqual(os.path.getsize(dl.dir + "/" + rel), 1234)
+
+        # chn1：直接用摄像头第 1 通道的图
+        m.IMAGE_LOG_SOURCE = "chn1"
+
+        class Chn:
+            def compress(self, quality):
+                return Jpg(300)
+        dl2 = m.DataLogger(self.tmp)
+        dl2.start()
+        self.assertEqual(dl2.save_image(0, self.img, Chn()), "img/0000/000000.jpg")
+        self.assertEqual(dl2.method, "chn1.jpeg")
+        dl2.close()
+
+    def test_no_encoder_works(self):
+        m = self.m
+
+        def bad(p, a, c):
+            raise ValueError("x")
+        dl = m.DataLogger(self.tmp, encoders=[("bad", "jpg", bad)])
+        dl.start()
+        self.assertEqual(dl.save_image(0, self.img, None), "")
+        self.assertFalse(dl.images_on)
+        self.assertTrue(dl.csv_on)
+        dl.close()
+
+    def test_jpeg_bytes_helper(self):
+        """_jpeg_bytes：按 size() 截断；不是 FF D8 开头的不算"""
+        m = self.m
+
+        class J:
+            def __init__(self, b, n):
+                self.b, self.n = b, n
+
+            def bytearray(self):
+                return bytearray(self.b)
+
+            def size(self):
+                return self.n
+
+        class Im:
+            def compress(self, quality):
+                return J(b"\xff\xd8abcdef" + b"\x00" * 100, 8)
+        self.assertEqual(m._jpeg_bytes(Im(), 80), b"\xff\xd8abcdef")
+
+        class Bad:
+            def to_jpeg(self, quality):
+                return J(b"\x00\x01xxxx", 6)
+        with self.assertRaises(ValueError):
+            m._jpeg_bytes(Bad(), 80)
+
+    def test_low_space_stops_images_then_all(self):
+        """剩余空间 < IMAGE_LOG_MIN_FREE_MB 停存图（CSV 照写）；< IMAGE_LOG_STOP_ALL_MB 全停；都不抛异常"""
+        m = self.m
+        MB = 1024 * 1024
+        fs = _FakeFS(1000 * MB)
+        dl = m.DataLogger(self.tmp, fs=fs, encoders=self.raw_only())
+        self.assertTrue(dl.start())
+        self.assertTrue(dl.save_image(0, self.img, None))
+        fs.free = (m.IMAGE_LOG_MIN_FREE_MB - 1) * MB
+        dl.free_checked = fs.free + 1                        # 估算也接近下限 -> 立即实测
+        self.assertEqual(dl.save_image(1, self.img, None), "")
+        self.assertFalse(dl.images_on)
+        self.assertTrue(dl.csv_on)
+        dl.frame_end(1, self.img, None, [], [], m.Tracker())
+        dl.images_on = True
+        fs.free = (m.IMAGE_LOG_STOP_ALL_MB - 1) * MB
+        dl.free_checked = fs.free
+        dl.frame_end(2, self.img, None, [], [], m.Tracker())
+        self.assertFalse(dl.csv_on)
+        dl.frame_end(3, self.img, None, [], [], m.Tracker())   # 停了以后再调用也不出错
+        self.assertEqual([r["frame"] for r in _read_csv(dl.dir + "/frames.csv")], ["1"])
+        dl.close()
+
+    def test_too_little_space_at_start(self):
+        m = self.m
+        dl = m.DataLogger(self.tmp, fs=_FakeFS(5 * 1024 * 1024))
+        self.assertFalse(dl.start())
+        self.assertIsNone(m._send_hook)
+
+    def test_space_estimate_between_checks(self):
+        """两次实测之间按写入字节估算剩余空间：写满到下限就停，不用每张图都 statvfs"""
+        m = self.m
+        MB = 1024 * 1024
+        m.IMAGE_LOG_SPACE_EVERY = 1000
+        fs = _FakeFS(m.IMAGE_LOG_MIN_FREE_MB * MB * 4)
+        big = [("big", "rgb", lambda p, a, c: (open(p, "wb").close(), 50 * MB)[1])]
+        dl = m.DataLogger(self.tmp, fs=fs, encoders=big)
+        dl.start()
+        n = 0
+        while dl.images_on and n < 100:
+            dl.save_image(n, self.img, None)
+            n += 1
+            fs.free = max(0, fs.free - 50 * MB)
+        self.assertFalse(dl.images_on)
+        self.assertEqual(n, 14)                              # 800MB，每张 50MB：存 12 张后估算 200MB，第 13 张后 150MB 停
+        self.assertLess(fs.checks, n + 2)
+        dl.close()
+
+    def test_budget_raises_every(self):
+        m = self.m
+        m.IMAGE_LOG_BUDGET_MS = 10
+        dl = m.DataLogger(self.tmp, encoders=self.raw_only())
+        dl.start()
+        dl.n_images = 10
+        for _ in range(3):
+            dl._note_cost(40.0)
+        self.assertGreater(dl.every, 1)
+        dl.close()
+
+    def test_disabled_main_loop_has_no_datalog(self):
+        """主循环里所有存图代码都在 "if dlog is not None" 后面，关闭时 dlog 一直是 None"""
+        with open(k230_stub.MAIN_PATH, encoding="utf-8") as f:
+            src = f.read()
+        body = src[src.index("def detection():"):src.index('if __name__ == "__main__":')]
+        self.assertIn("if IMAGE_LOG_ENABLE:", body)
+        uses = [i for i, ln in enumerate(body.splitlines()) if "dlog." in ln and "DataLogger" not in ln]
+        lines = body.splitlines()
+        for i in uses:
+            ctx = "\n".join(lines[max(0, i - 8):i + 1])
+            self.assertTrue("if dlog is not None" in ctx or "if dlog.start()" in ctx or "_res" in ctx, lines[i])
+
+
 # ====================================================================== 标定工具
 class TestDepthFit(unittest.TestCase):
     def setUp(self):

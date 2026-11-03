@@ -142,6 +142,26 @@ IGNORE_DRAW = True              # 在 OSD 上用红色虚线框画出忽略区�
 IGNORE_CALIB_MODE = False       # True：终端持续打印每个检测框的归一化中心和大小（不放物块时看爪子脚被识别成什么样）
 IGNORE_CALIB_EVERY_MS = 200     # 标定打印的最小间隔（毫秒）
 
+# ============================ 存图 + 同步标记（论文数据集，云端任务 12） ============================
+# 打开后：每 IMAGE_LOG_EVERY 帧把送进 AI 的那张图（旋转前）缩小后存到 SD 卡，
+# 每帧追加一行 frames.csv（K230 时钟、全部检测框、跟踪器状态、发出去的帧），
+# 树莓派同步线（树莓派 GPIO4 = uart3 TX → K230 UART1 RX）上收到的 "SYNC <序号> <树莓派时间>" 记到 sync.csv。
+# 目录：IMAGE_LOG_ROOT/s0001/、s0002/ ...（每次运行新建一个会话目录）。说明见 docs/cloud_tasks/results/12_报告.md
+# 默认关闭：关闭时主循环和原来完全一样（不读串口、不碰 SD 卡、不多一次计时）
+IMAGE_LOG_ENABLE = False
+IMAGE_LOG_ROOT = "/sdcard/datalog"
+IMAGE_LOG_EVERY = 1             # 每几帧存一张图（1 = 每帧）；frames.csv 每帧都写
+IMAGE_LOG_STEP = 4              # 缩小倍数：1280x720 每隔 4 个像素取 1 个 = 320x180
+IMAGE_LOG_FORMAT = "jpg"        # "jpg"；板子上 JPEG 编码接口都不可用时自动退回 "rgb"（原始平面 RGB，tools/raw2png.py 转换）
+IMAGE_LOG_QUALITY = 80          # JPEG 质量
+IMAGE_LOG_SOURCE = "ai"         # "ai" = 就用送进 AI 的那张图（软件缩小）；"chn1" = 摄像头第 1 通道硬件缩小（同一传感器帧，不占 CPU）
+IMAGE_LOG_MIN_FREE_MB = 200     # SD 卡剩余低于这个值就停止存图（frames.csv / sync.csv 照写）
+IMAGE_LOG_STOP_ALL_MB = 20      # 剩余低于这个值连 CSV 也停（检测和发帧不受影响）
+IMAGE_LOG_SPACE_EVERY = 100     # 每存这么多张图实测一次剩余空间（中间按写入的字节数估算）
+IMAGE_LOG_BUDGET_MS = 0         # >0：存图平均耗时超过这个毫秒数就自动隔更多帧存一张（保帧率）；0 = 不自动调
+IMAGE_LOG_FLUSH_EVERY = 10      # CSV 每几行 flush 一次（断电最多丢这么多行）
+SYNC_RX_ENABLE = True           # 存图打开时是否接收树莓派同步标记（IMAGE_LOG_ENABLE = False 时不起作用）
+
 # ============================ 显示 ============================
 display_mode = "hdmi"
 
@@ -1174,6 +1194,8 @@ def compute_position(raw_box, frame_w, frame_h, real_size, obb=None):
     }
 
 # ------------------------------ 串口发送 ------------------------------
+_send_hook = None     # 存图打开时由 DataLogger 设置：记下本帧实际发出去的 X/Y/D（关闭时为 None，不多做任何事）
+
 def send_position_via_uart(x_mm, y_mm, depth_mm, verbose=True):
     """格式: 0xAA 0x55 | X_H X_L | Y_H Y_L | D_H D_L | CRC8 | 0x0D，共10字节"""
     try:
@@ -1187,6 +1209,8 @@ def send_position_via_uart(x_mm, y_mm, depth_mm, verbose=True):
                            (d_u16 >> 8) & 0xFF, d_u16 & 0xFF])
         checksum = crc8(frame)
         uart.write(bytes(frame) + bytes([checksum, 0x0D]))
+        if _send_hook is not None:
+            _send_hook(x_int, y_int, d_int)
         if verbose:
             print("UART sent: X={} Y={} D={} | CRC=0x{:02X}".format(x_int, y_int, d_int, checksum))
     except Exception as e:
@@ -1265,12 +1289,484 @@ def pick_color(color_four, cls):
         pass
     return (0, 255, 0)
 
+# ------------------------------ 存图 + 同步标记（云端任务 12） ------------------------------
+# 只有 IMAGE_LOG_ENABLE = True 时才会创建 DataLogger；下面这些类和函数在关闭时完全不会被调用。
+# 所有 SD 卡 / 串口操作都包在 try 里：出错只会停掉存图，不会影响检测和发帧。
+
+class MonoUs:
+    """不回绕的微秒时钟。time.ticks_us() 约 18 分钟回绕一次，这里累加 ticks_diff 得到单调递增的值
+    （每帧都会调用，远小于回绕周期，所以不会漏掉回绕）"""
+    def __init__(self, ticks=None):
+        self._ticks = ticks or time.ticks_us
+        self._last = self._ticks()
+        self._acc = 0
+
+    def now(self):
+        t = self._ticks()
+        d = time.ticks_diff(t, self._last)
+        if d > 0:
+            self._acc += d
+            self._last = t
+        return self._acc
+
+def parse_sync_line(line):
+    """b'SYNC 12 3456.7890' -> (12, '3456.7890')；不是同步行返回 None。
+    树莓派时间按原文保存（字符串），离线对齐时和树莓派 jsonl 里的值逐字比对"""
+    try:
+        s = line.decode() if isinstance(line, (bytes, bytearray)) else str(line)
+    except Exception:
+        return None
+    parts = s.strip().split()
+    if len(parts) != 3 or parts[0] != "SYNC":
+        return None
+    try:
+        seq = int(parts[1])
+        float(parts[2])
+    except ValueError:
+        return None
+    return seq, parts[2]
+
+class SyncRx:
+    """不阻塞地读同步串口（和发位置帧的是同一个 UART1，RX 方向）。
+    每次 poll 返回这次收齐的同步标记 [(序号, 树莓派时间原文, 上次 poll 的微秒, 这次 poll 的微秒), ...]：
+    同步行的最后一个字节是在 (上次 poll, 这次 poll] 之间到的，离线对齐取中点、区间宽度就是这一条的不确定度"""
+    MAX_BUF = 256
+
+    def __init__(self, uart_obj, clock):
+        self.u = uart_obj
+        self.clock = clock
+        self.buf = b""
+        self.prev = clock.now()
+        self.ok = uart_obj is not None and hasattr(uart_obj, "any") and hasattr(uart_obj, "read")
+        self.errors = 0
+        self.count = 0
+        self.junk = 0
+
+    def poll(self):
+        now = self.clock.now()
+        prev, self.prev = self.prev, now
+        if not self.ok:
+            return []
+        try:
+            n = self.u.any()
+            if not n:
+                return []
+            data = self.u.read(n)
+        except Exception as e:
+            if is_stop(e):
+                raise
+            self.errors += 1
+            if self.errors >= 20:
+                self.ok = False
+                print("[DATALOG] 同步串口连续出错，停止接收同步标记:", e)
+            return []
+        if not data:
+            return []
+        self.buf = self.buf + bytes(data)
+        out = []
+        while True:
+            i = self.buf.find(b"\n")
+            if i < 0:
+                break
+            line, self.buf = self.buf[:i], self.buf[i + 1:]
+            r = parse_sync_line(line)
+            if r is None:
+                if line.strip():
+                    self.junk += 1
+                continue
+            out.append((r[0], r[1], prev, now))
+            self.count += 1
+        if len(self.buf) > self.MAX_BUF:      # 一直没有换行 = 线上是乱码（波特率不对等），丢掉
+            self.buf = b""
+            self.junk += 1
+        return out
+
+def tracker_state(tr):
+    """跟踪器状态：none 没目标 / tent 刚出现还没确认 / lock 锁定 / hold 锁定但本帧没检测到（预测中）"""
+    if tr is None or tr.smooth is None:
+        return "none"
+    if not tr.confirmed():
+        return "tent"
+    return "hold" if tr.miss > 0 else "lock"
+
+def format_dets(det_boxes, rects):
+    """全部检测框（忽略区域过滤之前）-> 'cls:score:x1:y1:x2:y2:ign|...'，原始 AI 画面像素（1280x720，旋转前）"""
+    parts = []
+    for b in det_boxes or []:
+        ign = 1 if (rects and in_ignore((b[2] + b[4]) / 2.0, (b[3] + b[5]) / 2.0, rects)) else 0
+        parts.append("{}:{:.3f}:{:.1f}:{:.1f}:{:.1f}:{:.1f}:{}".format(
+            int(b[0]), float(b[1]), float(b[2]), float(b[3]), float(b[4]), float(b[5]), ign))
+    return "|".join(parts)
+
+def free_bytes_of(path, fs=None):
+    """path 所在文件系统的剩余字节数；不支持 statvfs 时返回 None"""
+    fs = fs or os
+    try:
+        st = fs.statvfs(path)
+    except Exception as e:
+        if is_stop(e):
+            raise
+        return None
+    frsize = st[1] or st[0]
+    return int(frsize) * int(st[4])
+
+def next_session_name(names):
+    """已有目录名里最大的 sNNNN + 1（K230 没有可靠的日期时间，用序号命名会话）"""
+    n = 0
+    for s in names:
+        if len(s) == 5 and s[0] == "s" and s[1:].isdigit():
+            n = max(n, int(s[1:]))
+    return "s{:04d}".format(n + 1)
+
+def _mkdirs(path, fs):
+    cur = ""
+    for p in path.split("/"):
+        if not p:
+            cur = "/" if not cur else cur
+            continue
+        if not cur:
+            cur = p
+        else:
+            cur = cur + p if cur.endswith("/") else cur + "/" + p
+        try:
+            fs.mkdir(cur)
+        except OSError:
+            pass          # 已经存在
+
+def _jpeg_bytes(im, quality):
+    """CanMV 图像对象 -> JPEG 字节（依次试 to_jpeg / compress；结果必须以 FF D8 开头）"""
+    for name in ("to_jpeg", "compress"):
+        f = getattr(im, name, None)
+        if f is None:
+            continue
+        try:
+            j = f(quality=quality)
+        except Exception as e:
+            if is_stop(e):
+                raise
+            continue
+        j = j if j is not None else im
+        b = j.bytearray() if hasattr(j, "bytearray") else j
+        try:
+            n = j.size() if hasattr(j, "size") else len(b)
+        except Exception:
+            n = len(b)
+        b = bytes(b[:n])
+        if len(b) > 4 and b[0] == 0xFF and b[1] == 0xD8:
+            return b
+    raise ValueError("没有可用的 JPEG 编码接口")
+
+def _planar_image(small):
+    """(3, h, w) uint8 数组 -> CanMV RGBP888 图像对象"""
+    c, h, w = small.shape
+    try:
+        return image.Image(w, h, image.RGBP888, data=small)
+    except Exception as e:
+        if is_stop(e):
+            raise
+        return image.Image(w, h, image.RGBP888, data=bytearray(small.tobytes()))
+
+class DataLogger:
+    """
+    IMAGE_LOG_ENABLE 时的数据记录：SD 卡目录
+      <root>/sNNNN/info.txt        本次会话的参数（图像尺寸、缩小倍数、编码方式 ...）
+      <root>/sNNNN/frames.csv      每帧一行
+      <root>/sNNNN/sync.csv        每个同步标记一行
+      <root>/sNNNN/img/0000/000000.jpg   图像，每 1000 帧一个子目录（FAT 单目录文件多了建文件会越来越慢）
+    """
+    FRAME_COLS = "frame,t_ms,img,n_det,dets,trk,trk_cls,trk_score,trk_box,sent,sx,sy,sd,t_send_ms"
+    SYNC_COLS = "seq,pi_t,k230_ms_prev,k230_ms,frame"
+
+    def __init__(self, root, uart_obj=None, labels=None, fs=None, clock=None, encoders=None, frame_size=None):
+        self.root = root.rstrip("/") or "/"
+        self.fs = fs or os
+        self.clock = clock or MonoUs()
+        self.labels = labels or []
+        self.frame_size = frame_size or (OUT_RGB888P_WIDTH, OUT_RGB888P_HEIGHT)
+        self.sync = SyncRx(uart_obj, self.clock) if uart_obj is not None else None
+        self.encoders = encoders          # 测试用：替换板子上的编码接口
+        self.dir = None
+        self.f_frames = None
+        self.f_sync = None
+        self.images_on = False
+        self.csv_on = False
+        self.every = max(1, int(IMAGE_LOG_EVERY))
+        self.method = None                # 选定的编码方式名
+        self.ext = IMAGE_LOG_FORMAT
+        self.img_fail = 0
+        self.n_images = 0
+        self.bytes_since_check = 0
+        self.free_checked = None
+        self.cost_ema = None              # 存一张图的平均耗时（ms）
+        self.lines = 0
+        self.frame_sent = None
+        self.t_cap = 0
+        self.syncs = 0
+        self.last_img_dir = None
+
+    # ---------- 启动 / 关闭 ----------
+    def start(self):
+        global _send_hook
+        try:
+            _mkdirs(self.root, self.fs)
+            name = next_session_name(self.fs.listdir(self.root))
+            self.dir = self.root + "/" + name
+            _mkdirs(self.dir + "/img", self.fs)
+            free = free_bytes_of(self.root, self.fs)
+            self.free_checked = free
+            if free is not None and free < IMAGE_LOG_STOP_ALL_MB * 1024 * 1024:
+                print("[DATALOG] SD 卡剩余 {:.0f}MB，太少，不记录".format(free / 1048576.0))
+                return False
+            self.f_frames = open(self.dir + "/frames.csv", "w")
+            self.f_frames.write(self.FRAME_COLS + "\n")
+            self.f_sync = open(self.dir + "/sync.csv", "w")
+            self.f_sync.write(self.SYNC_COLS + "\n")
+            self.f_sync.flush()
+            with open(self.dir + "/info.txt", "w") as f:
+                for k, v in (("session", name), ("frame_w", self.frame_size[0]), ("frame_h", self.frame_size[1]),
+                             ("step", IMAGE_LOG_STEP), ("img_w", self.frame_size[0] // IMAGE_LOG_STEP),
+                             ("img_h", self.frame_size[1] // IMAGE_LOG_STEP), ("every", self.every),
+                             ("format", IMAGE_LOG_FORMAT), ("quality", IMAGE_LOG_QUALITY),
+                             ("source", IMAGE_LOG_SOURCE), ("rotate_deg", ROTATE_DEG),
+                             ("labels", ";".join(str(x) for x in self.labels)),
+                             ("clock", "t_ms = K230 ticks_us 累加（不回绕）/ 1000，程序启动时约为 0"),
+                             ("dets", "cls:score:x1:y1:x2:y2:ign，原始 AI 画面像素（旋转前）")):
+                    f.write("{}={}\n".format(k, v))
+            self.csv_on = True
+            self.images_on = True
+            _send_hook = self.on_sent
+            print("[DATALOG] 记录到", self.dir, "剩余空间",
+                  "未知" if free is None else "{:.0f}MB".format(free / 1048576.0),
+                  "| 同步接收", "开" if (self.sync and self.sync.ok) else "关")
+            return True
+        except Exception as e:
+            if is_stop(e):
+                raise
+            print("[DATALOG] 启动失败，不记录:", e)
+            self.close()
+            return False
+
+    def close(self):
+        global _send_hook
+        if _send_hook == self.on_sent:
+            _send_hook = None
+        for f in (self.f_frames, self.f_sync):
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+        self.f_frames = self.f_sync = None
+        self.csv_on = self.images_on = False
+
+    # ---------- 每帧调用 ----------
+    def on_sent(self, x, y, d):
+        """send_position_via_uart 发出一帧后调用（本帧发了几次就记最后一次）"""
+        self.frame_sent = (x, y, d, self.clock.now())
+
+    def frame_begin(self, frame_no):
+        """拍完照立即调用：记下拍照时刻，顺便收一次同步标记"""
+        self.t_cap = self.clock.now()
+        self.frame_sent = None
+        self.poll_sync(frame_no)
+        return self.t_cap
+
+    def poll_sync(self, frame_no=-1):
+        if self.sync is None or not self.csv_on:
+            return
+        got = self.sync.poll()
+        if not got:
+            return
+        try:
+            for seq, pi_t, t0, t1 in got:
+                self.f_sync.write("{},{},{:.1f},{:.1f},{}\n".format(seq, pi_t, t0 / 1000.0, t1 / 1000.0, frame_no))
+                self.syncs += 1
+            self.f_sync.flush()
+        except Exception as e:
+            if is_stop(e):
+                raise
+            print("[DATALOG] 写 sync.csv 出错:", e)
+
+    def want_image(self, frame_no):
+        return self.images_on and frame_no % self.every == 0
+
+    def frame_end(self, frame_no, np_img, chn_img, dets_all, rects, tracker):
+        if not self.csv_on:
+            return
+        self.poll_sync(frame_no)
+        name = ""
+        if self.want_image(frame_no):
+            t0 = time.ticks_us()
+            name = self.save_image(frame_no, np_img, chn_img)
+            self._note_cost(time.ticks_diff(time.ticks_us(), t0) / 1000.0)
+            if not self.csv_on:           # 空间实在不够，全部停了
+                return
+        try:
+            self.f_frames.write(self.frame_line(frame_no, name, dets_all, rects, tracker) + "\n")
+            self.lines += 1
+            if self.lines % max(1, IMAGE_LOG_FLUSH_EVERY) == 0:
+                self.f_frames.flush()
+        except Exception as e:
+            if is_stop(e):
+                raise
+            print("[DATALOG] 写 frames.csv 出错，停止记录:", e)
+            self.close()
+
+    def frame_line(self, frame_no, img_name, dets_all, rects, tracker):
+        st = tracker_state(tracker)
+        if st == "none":
+            tcls, tscore, tbox = "", "", ""
+        else:
+            s = tracker.smooth
+            tcls, tscore = str(tracker.cls), "{:.3f}".format(tracker.score)
+            tbox = "{:.1f}:{:.1f}:{:.1f}:{:.1f}".format(s[0], s[1], s[2], s[3])
+        fs = self.frame_sent
+        if fs is None:
+            sent = ",,,,"
+        else:
+            sent = "{},{},{},{},{:.1f}".format("hb" if fs[2] == 0 else "pos", fs[0], fs[1], fs[2], fs[3] / 1000.0)
+        n = len(dets_all) if dets_all else 0
+        return "{},{:.1f},{},{},{},{},{},{},{},{}".format(
+            frame_no, self.t_cap / 1000.0, img_name, n, format_dets(dets_all, rects), st, tcls, tscore, tbox, sent)
+
+    # ---------- 存图 ----------
+    def _note_cost(self, ms):
+        self.cost_ema = ms if self.cost_ema is None else 0.8 * self.cost_ema + 0.2 * ms
+        if IMAGE_LOG_BUDGET_MS > 0 and self.n_images >= 5 and self.cost_ema / self.every > IMAGE_LOG_BUDGET_MS \
+                and self.every < 30:
+            self.every += 1
+            self.cost_ema = None
+            print("[DATALOG] 存图平均耗时超过预算 {}ms/帧，改为每 {} 帧存一张".format(IMAGE_LOG_BUDGET_MS, self.every))
+
+    def image_rel(self, frame_no, ext):
+        return "img/{:04d}/{:06d}.{}".format(frame_no // 1000, frame_no, ext)
+
+    def _small(self, np_img):
+        s = max(1, int(IMAGE_LOG_STEP))
+        return np.array(np_img[:, ::s, ::s], dtype=np.uint8)
+
+    def _candidates(self):
+        """[(名字, 扩展名, fn(path, np_img, chn_img) -> 写入字节数)]，按顺序试，第一个成功的固定下来"""
+        if self.encoders is not None:
+            return self.encoders
+        q = IMAGE_LOG_QUALITY
+        out = []
+
+        def write_bytes(path, b):
+            with open(path, "wb") as f:
+                f.write(b)
+            return len(b)
+
+        def saved_size(path):
+            n = self.fs.stat(path)[6]
+            if n <= 0:
+                raise ValueError("空文件")
+            return n
+
+        if IMAGE_LOG_FORMAT == "jpg":
+            if IMAGE_LOG_SOURCE == "chn1":
+                out.append(("chn1.jpeg", "jpg", lambda p, a, c: write_bytes(p, _jpeg_bytes(c, q))))
+                out.append(("chn1.save", "jpg", lambda p, a, c: (c.save(p, quality=q), saved_size(p))[1]))
+            out.append(("rgbp888.to_rgb888.jpeg", "jpg",
+                        lambda p, a, c: write_bytes(p, _jpeg_bytes(_planar_image(self._small(a)).to_rgb888(), q))))
+            out.append(("rgbp888.jpeg", "jpg", lambda p, a, c: write_bytes(p, _jpeg_bytes(_planar_image(self._small(a)), q))))
+            out.append(("rgbp888.to_rgb888.save", "jpg",
+                        lambda p, a, c: (_planar_image(self._small(a)).to_rgb888().save(p, quality=q), saved_size(p))[1]))
+        # 最后的退路：原始平面 RGB（3 x h x w 字节，R 平面、G 平面、B 平面），PC 上用 tools/raw2png.py 转
+        out.append(("raw", "rgb", lambda p, a, c: write_bytes(p, self._small(a).tobytes())))
+        return out
+
+    def save_image(self, frame_no, np_img, chn_img):
+        """存一张图，返回相对路径（失败返回空字符串）。空间不足 / 连续失败时自动停止存图"""
+        try:
+            if not self._space_ok():
+                return ""
+            d = "{}/img/{:04d}".format(self.dir, frame_no // 1000)
+            if d != self.last_img_dir:
+                _mkdirs(d, self.fs)
+                self.last_img_dir = d
+            cands = self._candidates()
+            if self.method is not None:
+                cands = [c for c in cands if c[0] == self.method]
+            for (mname, ext, fn) in cands:
+                rel = self.image_rel(frame_no, ext)
+                try:
+                    n = fn(self.dir + "/" + rel, np_img, chn_img)
+                except Exception as e:
+                    if is_stop(e):
+                        raise
+                    if self.method is None:
+                        print("[DATALOG] 编码方式 {} 不可用: {}".format(mname, e))
+                        self._remove(self.dir + "/" + rel)
+                        continue
+                    raise
+                if self.method is None:
+                    self.method, self.ext = mname, ext
+                    print("[DATALOG] 存图方式:", mname, "（{} 字节/张）".format(n))
+                self.n_images += 1
+                self.bytes_since_check += n
+                self.img_fail = 0
+                return rel
+            print("[DATALOG] 没有可用的存图方式，停止存图（frames.csv 照写）")
+            self.images_on = False
+            return ""
+        except Exception as e:
+            if is_stop(e):
+                raise
+            self.img_fail += 1
+            print("[DATALOG] 存图出错 ({}): {}".format(self.img_fail, e))
+            if self.img_fail >= 5:
+                self.images_on = False
+                print("[DATALOG] 连续 5 次存图失败，停止存图（frames.csv 照写）")
+            return ""
+
+    def _remove(self, path):
+        try:
+            self.fs.remove(path)
+        except Exception:
+            pass
+
+    def _space_ok(self):
+        """按写入字节数估算剩余空间，每 IMAGE_LOG_SPACE_EVERY 张图（或估算接近下限时）实测一次"""
+        free = self.free_checked
+        est = None if free is None else free - self.bytes_since_check
+        need_check = (self.n_images > 0 and self.n_images % max(1, IMAGE_LOG_SPACE_EVERY) == 0) or \
+            (est is not None and est < 2 * IMAGE_LOG_MIN_FREE_MB * 1024 * 1024)
+        if need_check:
+            f = free_bytes_of(self.dir, self.fs)
+            if f is not None:
+                self.free_checked, self.bytes_since_check, est = f, 0, f
+        if est is None:
+            return True
+        if est < IMAGE_LOG_STOP_ALL_MB * 1024 * 1024:
+            print("[DATALOG] SD 卡剩余 {:.0f}MB，停止全部记录".format(est / 1048576.0))
+            self.close()
+            return False
+        if est < IMAGE_LOG_MIN_FREE_MB * 1024 * 1024:
+            print("[DATALOG] SD 卡剩余 {:.0f}MB < {}MB，停止存图（frames.csv 照写）".format(
+                est / 1048576.0, IMAGE_LOG_MIN_FREE_MB))
+            self.images_on = False
+            return False
+        return True
+
+    def status(self):
+        return "[DATALOG] 图 {} 张（{}，每 {} 帧）| 同步 {} 个 | 平均存图 {}ms".format(
+            self.n_images, self.method or "-", self.every, self.syncs,
+            "-" if self.cost_ema is None else "{:.1f}".format(self.cost_ema))
+
 # ------------------------------ 主流程 ------------------------------
 # 已初始化的硬件资源，退出时由 cleanup() 统一释放（无论是正常结束、出错还是 IDE 停止）
-_res = {"sensor": None, "display": False, "media": False}
+_res = {"sensor": None, "display": False, "media": False, "dlog": None}
 
 def cleanup():
     print("Shutting down...")
+    if _res.get("dlog") is not None:
+        try:
+            print(_res["dlog"].status())
+            _res["dlog"].close()
+        except Exception as e:
+            print("datalog close error:", e)
+        _res["dlog"] = None
     s = _res["sensor"]
     if s is not None:
         try:
@@ -1366,6 +1862,17 @@ def detection():
         sensor.set_framesize(width=FW, height=FH, chn=CAM_CHN_ID_2)
         sensor.set_pixformat(PIXEL_FORMAT_YUV_SEMIPLANAR_420)
         sensor.set_pixformat(PIXEL_FORMAT_RGB_888_PLANAR, chn=CAM_CHN_ID_2)
+        if IMAGE_LOG_ENABLE and IMAGE_LOG_SOURCE == "chn1":
+            # 存图用的第 1 通道：ISP 硬件缩小，不占 CPU（只在 IMAGE_LOG_SOURCE = "chn1" 时配置）
+            # 配置失败（固件不支持该尺寸 / 格式）就退回 "ai"，不影响检测
+            try:
+                sensor.set_framesize(width=FW // IMAGE_LOG_STEP, height=FH // IMAGE_LOG_STEP, chn=CAM_CHN_ID_1)
+                sensor.set_pixformat(PIXEL_FORMAT_RGB_888, chn=CAM_CHN_ID_1)
+            except Exception as e:
+                if is_stop(e):
+                    raise
+                print("[DATALOG] 第 1 通道配置失败，改用 AI 图软件缩小:", e)
+                globals()["IMAGE_LOG_SOURCE"] = "ai"
 
         bind_info = sensor.bind_info(x=VID_X, y=VID_Y, chn=CAM_CHN_ID_0)
         if ROTATED:
@@ -1413,6 +1920,16 @@ def detection():
         print("ignore regions (display 0~1):", IGNORE_REGIONS)
         print("ignore regions (raw {}x{} px):".format(FW, FH),
               [tuple(int(round(v)) for v in r) for r in ign_rects])
+    # 存图 + 同步标记（任务 12，默认关闭）：关闭时 dlog 为 None，主循环里所有相关代码都跳过
+    dlog = None
+    dets_all = None
+    chn1_img = None
+    if IMAGE_LOG_ENABLE:
+        dlog = DataLogger(IMAGE_LOG_ROOT, uart if SYNC_RX_ENABLE else None, labels=labels, frame_size=(FW, FH))
+        if dlog.start():
+            _res["dlog"] = dlog
+        else:
+            dlog = None
     print("Init done. rotate={} video={}x{} at ({},{})".format(ROTATE_DEG, VID_W, VID_H, VID_X, VID_Y))
 
     while True:
@@ -1423,6 +1940,15 @@ def detection():
                 rgb888p_img = sensor.snapshot(chn=CAM_CHN_ID_2)
                 if rgb888p_img.format() != image.RGBP888:
                     continue
+                if dlog is not None:
+                    dlog.frame_begin(frame_no)          # 拍照时刻 + 收同步标记
+                    chn1_img = None
+                    if IMAGE_LOG_SOURCE == "chn1" and dlog.want_image(frame_no):
+                        try:
+                            chn1_img = sensor.snapshot(chn=CAM_CHN_ID_1)
+                        except Exception as e:
+                            if is_stop(e):
+                                raise
                 prof.mark("capture")
 
                 np_img = rgb888p_img.to_numpy_ref()
@@ -1432,6 +1958,8 @@ def detection():
 
                 kpu.set_input_tensor(0, ai2d_output_tensor)
                 kpu.run()
+                if dlog is not None:
+                    dlog.poll_sync(frame_no)            # KPU 推理较久，中间多收一次，同步时刻更准
                 prof.mark("ai2d+kpu")
 
                 results = []
@@ -1450,6 +1978,8 @@ def detection():
                 del results
                 prof.mark("post")
 
+                if dlog is not None:
+                    dets_all = list(det_boxes or [])    # 过滤前的全部检测框（含爪子脚），记到 frames.csv
                 # ---------- 忽略区域（爪子脚）：中心落在区域里的检测框不进跟踪器 ----------
                 if ign_calib is not None:
                     txt = ign_calib.feed(det_boxes or [], ign_rects, labels, time.ticks_ms())
@@ -1598,6 +2128,13 @@ def detection():
 
                 if draw_osd:
                     Display.show_image(osd_img, OSD_X, OSD_Y, Display.LAYER_OSD3)
+                if dlog is not None:
+                    # 发完帧、显示完再存图，存图耗时不会推迟本帧的串口发送
+                    dlog.frame_end(frame_no, np_img, chn1_img, dets_all, ign_rects, tracker)
+                    chn1_img = None
+                    if frame_no % 300 == 0:
+                        print(dlog.status())
+                    prof.mark("datalog")
                 del np_img
                 frame_no += 1
                 if GC_MIN_FREE_KB > 0:
