@@ -453,6 +453,9 @@ class WheeltecChassis:
             while True:
                 el = self._now() - t0
                 if fb:
+                    if not self.has_feedback():
+                        # 回传断了：里程不再增加，原来会按 remaining 一直全速开到超时（400mm 的一步要 23 秒才超时）
+                        raise DeviceError("底盘回传中断（行驶中 0.5 秒没收到状态帧），已停车")
                     with self._lock:
                         done = abs(self.dist - d0)
                         v_act = abs(self.fb_vx)

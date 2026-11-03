@@ -238,5 +238,88 @@ class TestStopSignals(unittest.TestCase):
         self.assertGreater(vx, 0)
 
 
+def wheeltec_fb(vx=0, volt_mv=25000, flag=0):
+    f = bytearray(24)
+    f[0], f[1] = 0x7B, flag
+    f[2:4] = (vx & 0xFFFF).to_bytes(2, "big")
+    f[20:22] = volt_mv.to_bytes(2, "big")
+    b = 0
+    for x in f[:22]:
+        b ^= x
+    f[22], f[23] = b, 0x7D
+    return bytes(f)
+
+
+class TestChassisFeedbackLoss(unittest.TestCase):
+    """报告 [伤硬件-3]（修复）：底盘行驶中回传断了，原来会一直全速开到超时"""
+
+    def test_drive_stops_when_feedback_stops(self):
+        written = []
+        t_start = time.monotonic()
+
+        class S:
+            def __init__(self, *a, **k):
+                pass
+
+            def write(self, b):
+                written.append(bytes(b))
+
+            def flush(self):
+                pass
+
+            def read(self, n):
+                time.sleep(0.05)               # 20Hz 回传
+                # 前 0.6 秒正常回传（车速回传 0：轮子打滑 / 编码器线松），之后回传断了
+                return wheeltec_fb() if time.monotonic() - t_start < 0.6 else b""
+
+            def close(self):
+                pass
+
+        install_fake(S)
+        ch = devices.WheeltecChassis("x", 115200, 100, 600, True, None, cmd_ttl_s=0)
+        try:
+            self.assertTrue(ch.has_feedback())
+            t0 = time.monotonic()
+            with self.assertRaises(devices.DeviceError) as cm:
+                ch.drive(400, timeout=8.0)
+            dt = time.monotonic() - t0
+            # 改之前：一直以 100mm/s 发指令，8 秒后才报"底盘移动超时"
+            self.assertLess(dt, 2.0, f"{dt:.1f}s 后才停：{cm.exception}")
+            self.assertIn("回传中断", str(cm.exception))
+            self.assertEqual(ch.cmd, (0, 0))
+        finally:
+            ch.close()
+        self.assertEqual(written[-1], devices.WheeltecChassis.frame(0, 0))
+
+    def test_normal_drive_unaffected(self):
+        """回传一直在：照常走完（假控制器按指令速度回传）"""
+        st = {"vx": 0}
+
+        class S:
+            def __init__(self, *a, **k):
+                pass
+
+            def write(self, b):
+                st["vx"] = int.from_bytes(b[3:5], "big", signed=True)
+
+            def flush(self):
+                pass
+
+            def read(self, n):
+                time.sleep(0.05)
+                return wheeltec_fb(st["vx"])
+
+            def close(self):
+                pass
+
+        install_fake(S)
+        ch = devices.WheeltecChassis("x", 115200, 100, 600, True, None)
+        try:
+            moved, _ = ch.drive(60, timeout=8.0)
+            self.assertGreater(moved, 20)
+        finally:
+            ch.close()
+
+
 if __name__ == "__main__":
     unittest.main()
