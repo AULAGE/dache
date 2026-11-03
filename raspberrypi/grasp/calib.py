@@ -171,10 +171,19 @@ def jog(name):
     if name == "drop" and cfg.BASE_ID in cfg.POSES["drop"]:
         cur[cfg.BASE_ID] = cfg.POSES["drop"][cfg.BASE_ID]
     arm_move(cur, 1500)
+    try:
+        cam = open_cam()                   # 每动一下显示一次 K230 读数，边调边看
+    except Exception as e:
+        cam = None
+        print("（K230 打不开，不显示读数：", e, "）")
     print("点动命令：'4 +20' 4 号舵机 +20us；'5 =1900' 直接设；'b +10' 底座转 10°；"
-          "'o' 张爪；'c' 合爪；'s' 保存；'q' 退出")
+          "'o' 张爪；'c' 合爪；'s' 保存；'q' 退出；直接回车 = 只看读数")
     while True:
+        if cam is not None:
+            print("   K230：", fmt(measure(cam, n=4, settle=0.5, timeout=2.0)))
         cmd = ask(f"[{name}] {dict(sorted(cur.items()))} > ")
+        if cmd == "":
+            continue
         if cmd in ("q", "quit", "exit"):
             break
         if cmd == "s":
@@ -258,10 +267,16 @@ def auto():
         print(f"  → 方位角变化 {dx:+.2f}°：脉宽增大是{'右' if base_dir == 1 else '左'}转，BASE_DIR = {base_dir}")
         print(f"  → 方位角/转角 = {ratio:.2f}，估算相机到底座转轴 R_CAM_MM ≈ {r_est:.0f}mm（配置里是 {cfg.R_CAM_MM:.0f}）")
         result["BASE_DIR"] = base_dir
-        if 0.9 <= ratio <= 4:
+        if 1.05 <= ratio <= 4:
             result["R_CAM_MM"] = round(r_est)
+        elif 0.4 <= ratio < 1.05:
+            # 比值 ≤ 1：这个姿态下相机几乎在底座转轴上（甚至稍靠后，机械臂收拢时常见）。
+            # 半径按 0 算，转 1° 物块偏 ratio 度 → 直接存成底座的灵敏度初值
+            print(f"  → 相机基本在底座转轴上：R_CAM_MM 记为 0，底座灵敏度 j0 = {-ratio:.2f}")
+            result["R_CAM_MM"] = 0
+            result.setdefault("AXES_J0", {})["x_deg"] = round(-ratio, 3)
         else:
-            print("  ⚠ 比值不合理，R_CAM_MM 先不保存")
+            print("  ⚠ 比值不合理（底座可能没转到位 / 物块出了画面），R_CAM_MM 先不保存")
     else:
         print("  ⚠ 转动后看不到物块了，跳过底座这一项")
 
