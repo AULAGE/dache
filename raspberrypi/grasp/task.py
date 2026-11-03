@@ -428,6 +428,17 @@ class GraspTask:
             far = any(abs(e[k]) > 4 * c.TOL[k] for k in self.axis_names)
             m2 = self.measure(c.SAMPLE_N_FAR if far else None)
 
+            if m2 is not None and c.CHASSIS_JUMP_CHECK and abs(moved) > 0:
+                # 任务 18：底盘走完以后，深度变化和里程对不上（例如往前走了 287mm，深度反而大了 153mm）→
+                # 多半是误识别 / 跟踪器换了目标。原来直接照着新读数再开一大步，仿真里开过了物块（会撞平台）。
+                # 再确认一次：确认不了就当丢失，回去重新搜索
+                want = e["d"] + self.axes["d"].j * math.cos(math.radians(base_old)) * moved
+                got = m2.err(goal)["d"]
+                if abs(got - want) > max(c.CHASSIS_JUMP_D_MM, 0.5 * abs(moved)):
+                    self.say(f"对准：底盘走了 {moved:+.0f}mm，深度误差应约 {want:+.0f}mm，读到 {got:+.0f}mm，"
+                             f"对不上（可能是误识别），再确认一次")
+                    m2 = self.confirm_target(m2)
+
             if m2 is not None and c.GHOST_CHECK:
                 e2 = m2.err(goal)
                 checks = []
