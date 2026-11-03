@@ -18,6 +18,7 @@ import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+os.environ["GRASP_IGNORE_CALIB"] = "1"     # 测试按 config.py 默认值写，忽略这台车的 calib.json
 
 import devices  # noqa: E402
 
@@ -480,10 +481,10 @@ def test_chassis_fw():
 def test_calib_override():
     print("calib.json 覆盖 config")
     import config
-    path = config.CALIB_FILE
-    if os.path.exists(path):
-        check("（跳过：已有真实的 calib.json，不覆盖它）", True)
-        return
+    # 用临时文件，不碰这台车真实的 calib.json；测试期间打开覆盖功能
+    path = os.path.join(tempfile.mkdtemp(), "calib.json")
+    os.environ["GRASP_CALIB_FILE"] = path
+    os.environ.pop("GRASP_IGNORE_CALIB", None)
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"GOAL": {"x_deg": 1, "y": 2, "d": 150}, "POSES": {"observe": {"2": 1400}},
@@ -492,10 +493,15 @@ def test_calib_override():
         check("白名单参数被覆盖", config.GOAL["d"] == 150 and config.BASE_DIR == -1 and config.AXES["y"]["j0"] == 9.5)
         check("姿态只覆盖写了的舵机字典", config.POSES["observe"] == {2: 1400})
         check("不在白名单的忽略", not hasattr(config, "NOT_ALLOWED"))
-    finally:
         os.remove(path)
         importlib.reload(config)
-    check("删掉 calib.json 恢复默认", config.GOAL["d"] == 160.0)
+        check("删掉 calib.json 恢复默认", config.GOAL["d"] == 160.0)
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+        os.environ.pop("GRASP_CALIB_FILE", None)
+        os.environ["GRASP_IGNORE_CALIB"] = "1"
+        importlib.reload(config)
 
 
 # ------------------------------------------------------------ 单步模式 / 手柄接管

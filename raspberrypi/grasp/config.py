@@ -219,7 +219,7 @@ LOG_DIR = "logs"
 import json as _json
 import os as _os
 
-CALIB_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "calib.json")
+CALIB_FILE = _os.environ.get("GRASP_CALIB_FILE") or     _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "calib.json")
 CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "GOAL", "TOL", "R_CAM_MM", "BASE_DIR", "BASE_CENTER", "BASE_US_PER_DEG", "CLAW_OPEN", "CLAW_CLOSE",
     "REACH_NEAR_D", "REACH_FAR_D", "POSES_CALIBRATED", "ACK_MIN_RADIUS_MM", "K230_ROTATE", "LIFT_MAX_CM",
@@ -234,6 +234,8 @@ CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
 
 def _apply_calib():
     g = globals()
+    if _os.environ.get("GRASP_IGNORE_CALIB"):     # selftest 用：测试按默认参数写，不受每台车的标定影响
+        return {}
     try:
         with open(CALIB_FILE, encoding="utf-8") as f:
             data = _json.load(f)
