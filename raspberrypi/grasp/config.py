@@ -21,10 +21,23 @@
 PORTS = {
     "k230":    "/dev/ttyAMA3",   # GPIO5（物理脚 29）= uart3 RX；config.txt 里 dtoverlay=uart3   [重启后确认名字]
     "lift":    "/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0-port0",
-    "arm":     "/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0-port0",   # 机械臂板 CH340，USB 口 1.3
+    "arm":     None,             # 自动选择，见下面 ARM_PORT_CANDIDATES
     "chassis": "/dev/serial/by-id/usb-WCH.CN_USB_Single_Serial_0002-if00",
 }
 BAUD = {"k230": 115200, "lift": 115200, "arm": 9600, "chassis": 115200}
+
+# 机械臂串口：按顺序用第一个存在的。
+#   1) J-Link 的虚拟串口（J-Link 的 RX/TX/GND 接机械臂板 PA9/PA10/GND）：机械臂板自带的 USB（CH340）
+#      2026-11-03 一直识别失败（descriptor error -32/-71），改用 J-Link 当 USB 转串口。有唯一序列号，名字固定
+#   2) 机械臂板自带的 USB（CH340），插在 USB 口 1.3
+ARM_PORT_CANDIDATES = [
+    "/dev/serial/by-id/usb-SEGGER_J-Link_000063728934-if00",
+    "/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0-port0",
+]
+if PORTS["arm"] is None:
+    import os as _os0
+    PORTS["arm"] = next((p for p in ARM_PORT_CANDIDATES if _os0.path.exists(p)), ARM_PORT_CANDIDATES[0])
+
 
 USE_CHASSIS = True    # 没有底盘（固定工位）就改成 False：深度不再闭环，只靠机械臂伸出姿态插值
 CHASSIS_ACKERMANN = True   # 阿克曼转向（不能原地转，只能边走边转）
