@@ -3,13 +3,17 @@
 
   o_t ──CNN 编码器──► 特征图 ──Slot Attention（K 个槽位，初值 = 上一步的预测）──► 槽位 (z_k, p_k)
                                                                     p_k = 注意力图的质心（画面坐标 −1~1）
-  [u_t, 槽位位置] ──迟滞记忆 GRU──► h_{t+1} ──线性──► c_{t+1}（相机位姿，画面坐标）
-  动力学（分离先验）：p̂_{t+1,k} = p_{t,k} + w_k · (c_{t+1} − c_t)，  ẑ_{t+1,k} = z_{t,k} + MLP(z, u)
+  [u_t, 槽位位置] ──迟滞记忆 GRU──► h_{t+1}
+  相机运动：Δc_t = A·Δ命令_t（物理先验，可学的 2×2 线性）+ W·h_{t+1} − W·h_t（迟滞修正，只能从 h 来）
+  动力学（分离先验）：p̂_{t+1,k} = p_{t,k} + w_k · Δc_t，  ẑ_{t+1,k} = z_{t,k} + MLP(z, u)
                        w_k = sigmoid(MLP(z_k)) ∈ [0, 1]：0 = 自身（和相机固连，不动），1 = 世界（随相机动）
   解码器：每个槽位用"相对自己位置"的坐标网格做空间广播 → RGB + alpha，softmax 合成
-  损失：重建 o_t（看到之后的槽位）+ 预测 o_{t+1}（只用 ẑ、p̂，不看 o_{t+1}）+ 自身槽位位移 ≈ 0 的正则
+  损失：重建 o_t（看到之后的槽位）+ 预测 o_{t+1}（只用 ẑ、p̂，不看 o_{t+1}）
+        + 平移预测：ô_{t+1} = Σ_k m_k·[w_k·平移(o_t, Δc) + (1 − w_k)·o_t]（像素级的分离先验）
+        + 紧凑槽位的观测位移 = w·Δc 的正则
 
-h_t 就是学出来的"本体感知"：训练时没有任何角度标注，c 只能通过"世界槽位怎么移动"学出来。
+h_t 就是学出来的"本体感知"：训练时没有任何角度标注；"实际比命令少走 / 多走了多少"只能通过
+"世界槽位 / 世界像素怎么移动"学出来，存在 h 里。
 评估时冻结模型，用线性探针从 h 解码真实舵机角（eval.py）。
 
 对照组（--variant）：
@@ -25,6 +29,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 VARIANTS = ("full", "noprior", "nogru", "cmdonly")
+
+
+def translate(img, shift):
+    """把图像整体平移 shift（画面坐标 −1~1，[B, 2] 或 [B, K, 2]）：内容往 +shift 方向移动"""
+    B = img.shape[0]
+    n = img.shape[-1]
+    g = grid(n, n, img.device)
+    if shift.dim() == 2:
+        return F.grid_sample(img, (g[None] - shift[:, None, None, :]).expand(B, n, n, 2),
+                             padding_mode="border", align_corners=True)
+    K = shift.shape[1]
+    src = img[:, None].expand(B, K, *img.shape[1:]).reshape(B * K, *img.shape[1:])
+    out = F.grid_sample(src, g[None] - shift.reshape(B * K, 1, 1, 2), padding_mode="border", align_corners=True)
+    return out.reshape(B, K, *img.shape[1:])
 
 
 def grid(h, w, device=None):
@@ -92,6 +110,9 @@ class Decoder(nn.Module):
         self.lz = nn.Linear(d, hidden)
         self.lr = nn.Linear(fdim, hidden, bias=False)
         self.net = nn.Sequential(nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 4))
+        # 局部性先验：alpha 再减去 |像素 − p|²/(2σ²)，σ 由 z 决定（物块小、背景可以学成很大）
+        self.scale = nn.Linear(d, 1)
+        nn.init.constant_(self.scale.bias, -1.0)
 
     def fourier(self, rel):
         fs = [rel]
@@ -106,7 +127,9 @@ class Decoder(nn.Module):
         g = grid(n, n, z.device)                                    # [n, n, 2]
         rel = self.fourier(g[None, None] - p[:, :, None, None, :])  # [B, K, n, n, F]
         y = self.net(self.lr(rel) + self.lz(z)[:, :, None, None, :])   # [B, K, n, n, 4]
-        rgb, alpha = torch.sigmoid(y[..., :3]), y[..., 3]
+        d2 = ((g[None, None] - p[:, :, None, None, :]) ** 2).sum(-1)   # [B, K, n, n]
+        sig2 = torch.exp(2 * self.scale(z).clamp(-4, 2))[..., None]   # [B, K, 1, 1]
+        rgb, alpha = torch.sigmoid(y[..., :3]), y[..., 3] - d2 / (2 * sig2)
         m = alpha.softmax(1)                                        # [B, K, n, n]
         return (rgb * m[..., None]).sum(1).permute(0, 3, 1, 2), m
 
@@ -125,8 +148,15 @@ class WorldModel(nn.Module):
             self.mem = nn.Sequential(nn.Linear(mem_in, hdim), nn.Tanh(), nn.Linear(hdim, hdim), nn.Tanh())
         else:
             self.mem = nn.GRUCell(mem_in, hdim)
-        self.cam = nn.Linear(hdim, 2)                     # 相机位姿（画面坐标）= h 的线性函数
+        self.cam = nn.Linear(hdim, 2)                     # 迟滞修正（画面坐标）= h 的线性函数
+        self.cam_cmd = nn.Linear(2, 2, bias=False)        # 物理先验：命令决定的那部分相机运动（2×2 线性）
         self.world = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, 1))
+        # 初始化：相机位姿 c 从 0 开始（随机的 Δc 会让预测变差，模型就会把 w 全关掉，卡在局部最优），
+        # w 初始偏"世界"（sigmoid(2) ≈ 0.88），让预测损失的梯度先去教 c
+        nn.init.zeros_(self.cam.weight)
+        nn.init.zeros_(self.cam.bias)
+        nn.init.zeros_(self.cam_cmd.weight)
+        nn.init.constant_(self.world[2].bias, 2.0)
         self.zdyn = nn.Sequential(nn.Linear(d + u_dim, d), nn.ReLU(), nn.Linear(d, d))
         if variant == "noprior":
             self.pdyn = nn.Sequential(nn.Linear(d + 2 * hdim + u_dim, d), nn.ReLU(), nn.Linear(d, 2))
@@ -159,11 +189,14 @@ class WorldModel(nn.Module):
         """
         B, T1 = obs.shape[:2]
         T = T1 - 1
+        # 每帧按自己的通道均值归一化：去掉全局光照增益（无监督预处理，不用任何标注）
+        obs = obs / obs.mean(dim=(-1, -2), keepdim=True).clamp(min=1e-3) * 0.5
         tgt = F.avg_pool2d(obs.flatten(0, 1), self.res // self.dec_res).reshape(B, T1, 3, self.dec_res, self.dec_res) \
             if self.dec_res != self.res else obs
         h = torch.zeros(B, self.hdim, device=obs.device)
         slots = self.slot_init.expand(B, -1, -1)
-        rec_l, pred_l, self_l = 0.0, 0.0, 0.0
+        rec_l, pred_l, self_l, warp_l = 0.0, 0.0, 0.0, 0.0
+        dcs = []
         hs, ws, masks, ps, cs = [h], [], [], [], []
         for t in range(T1):
             feats = self.enc(obs[:, t])
@@ -185,9 +218,17 @@ class WorldModel(nn.Module):
                 uu = ut[:, None].expand(-1, self.k, -1)
                 p_hat = p + self.pdyn(torch.cat([slots, hh, uu], -1))
             else:
-                c_t, c_n = self.cam(h), self.cam(h_next)
-                dc = (c_n - c_t)[:, None]                              # [B, 1, 2]
+                dc = (self.cam_cmd(ut[:, 2:4]) + self.cam(h_next) - self.cam(h))[:, None]   # [B, 1, 2]
+                dcs.append(dc[:, 0])
                 p_hat = p + w[..., None] * dc
+            # 像素级的分离先验（便宜、信号强）：世界槽位覆盖的像素按相机运动平移，自身槽位的不动
+            cur, nxt = tgt[:, t], tgt[:, t + 1]
+            if self.variant == "noprior":
+                o_hat = (m[:, :, None] * translate(cur, p_hat - p)).sum(1)    # 每个槽位按自己的位移平移
+            else:
+                ww = (m * w[..., None, None]).sum(1, keepdim=True)            # [B, 1, s, s] 属于"世界"的程度
+                o_hat = ww * translate(cur, dc[:, 0]) + (1 - ww) * cur
+            warp_l = warp_l + F.mse_loss(o_hat, nxt)
             z_hat = slots + self.zdyn(torch.cat([slots, ut[:, None].expand(-1, self.k, -1)], -1))
             rgb_hat, _ = self.dec(z_hat, p_hat)
             pred_l = pred_l + F.mse_loss(rgb_hat, tgt[:, t + 1])
@@ -199,13 +240,11 @@ class WorldModel(nn.Module):
         if self.variant != "noprior":
             P = torch.stack(ps, 1)                                     # [B, T+1, K, 2]
             W = torch.stack(ws, 1)[:, :-1]                             # [B, T, K]
-            H = torch.stack(hs, 1)                                     # [B, T+1, hdim]
-            C = self.cam(H)                                            # [B, T+1, 2]
             dP = P[:, 1:] - P[:, :-1]
-            dC = (C[:, 1:] - C[:, :-1])[:, :, None]
+            dC = torch.stack(dcs, 1)[:, :, None]                       # [B, T, 1, 2]
             # 只对"紧凑"的槽位（物块、爪子）算：铺满全图的背景槽位质心不随相机动，不能用质心检验
             Kc = torch.stack(cs, 1)[:, 1:].detach()                    # [B, T, K]
             self_l = (Kc * ((dP - W[..., None] * dC) ** 2).sum(-1)).sum() / Kc.sum().clamp(min=1e-6)
-        return {"rec": rec_l / T1, "pred": pred_l / T, "sep": self_l,
+        return {"rec": rec_l / T1, "pred": pred_l / T, "sep": self_l, "warp": warp_l / T,
                 "h": torch.stack(hs, 1), "w": torch.stack(ws, 1), "masks": torch.stack(masks, 1),
                 "pos": torch.stack(ps, 1)}

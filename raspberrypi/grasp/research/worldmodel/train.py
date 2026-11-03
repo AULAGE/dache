@@ -64,16 +64,17 @@ def train_one(variant, data, tr, args, device, f):
         for g in opt.param_groups:
             g["lr"] = lr
         out = model(obs, u)
-        loss = out["rec"] + args.pred_w * out["pred"] + args.sep_w * out["sep"]
+        loss = out["rec"] + args.pred_w * out["pred"] + args.sep_w * out["sep"] + args.warp_w * out["warp"]
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        hist.append([out["rec"].item(), out["pred"].item(), out["sep"].item() if torch.is_tensor(out["sep"]) else 0.0])
+        hist.append([out["rec"].item(), out["pred"].item(), out["sep"].item() if torch.is_tensor(out["sep"]) else 0.0,
+                     out["warp"].item()])
         step += 1
         if step % args.log_every == 0:
             m = np.mean(hist[-args.log_every:], 0)
-            log(f, f"  {variant} 步 {step:5d}  {time.time() - t0:6.0f}s  重建 {m[0]:.5f}  预测 {m[1]:.5f}  分离 {m[2]:.5f}")
+            log(f, f"  {variant} 步 {step:5d}  {time.time() - t0:6.0f}s  重建 {m[0]:.5f}  预测 {m[1]:.5f}  分离 {m[2]:.5f}  平移 {m[3]:.5f}")
     log(f, f"  {variant} 共 {step} 步，{time.time() - t0:.0f}s")
     return model, step
 
@@ -93,10 +94,11 @@ def main():
     ap.add_argument("--slots", type=int, default=4)
     ap.add_argument("--dim", type=int, default=32)
     ap.add_argument("--hdim", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=4e-4)
-    ap.add_argument("--warmup", type=int, default=200)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--pred-w", type=float, default=1.0)
     ap.add_argument("--sep-w", type=float, default=0.1)
+    ap.add_argument("--warp-w", type=float, default=1.0)
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--threads", type=int, default=0)
     a = ap.parse_args()

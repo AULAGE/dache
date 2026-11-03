@@ -60,10 +60,10 @@ def make_texture(rng, size=256):
         a = rng.uniform(0, 2 * math.pi)
         ph = rng.uniform(0, 2 * math.pi)
         w = np.sin(f * (xx * math.cos(a) + yy * math.sin(a)) + ph)
-        tex += w[..., None] * rng.uniform(-0.05, 0.05, size=3)
+        tex += w[..., None] * rng.uniform(-0.025, 0.025, size=3)
     # 平台边缘：一条水平分界（上面墙、下面台面），让纵向移动也有明显的特征
     edge = size // 2 + int(rng.integers(-20, 20))
-    tex[edge:] += rng.uniform(-0.12, 0.12, size=3)
+    tex[edge:] += rng.uniform(-0.06, 0.06, size=3)
     return np.clip(tex + base, 0.0, 1.0)
 
 
@@ -106,7 +106,7 @@ class Scene:
         hue = rng.uniform(0, 1)
         rgb = np.array([abs(math.sin(math.pi * (hue + k / 3.0))) for k in range(3)])
         rgb = 0.15 + 0.8 * rgb / max(rgb.max(), 1e-6)
-        return {"x0": rng.uniform(-6, 6), "y0": rng.uniform(-15, 15), "d": rng.uniform(150, 230), "rgb": rgb}
+        return {"x0": rng.uniform(-6, 6), "y0": rng.uniform(-12, 12), "d": rng.uniform(110, 160), "rgb": rgb}
 
     def step_distractors(self):
         """手（独立运动的干扰物）每一步随机移动，和动作无关"""

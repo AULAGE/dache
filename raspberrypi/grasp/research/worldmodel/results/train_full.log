@@ -1,0 +1,3 @@
+任务 14 世界模型（合成数据）  模式 full  设备 cpu  torch 2.15.0+cu132  线程 4
+参数： {"quick": false, "variants": "full,noprior,nogru,cmdonly", "seed": 0, "n_train": 1200, "n_test": 200, "seq_len": 24, "T": 12, "minutes": 15.0, "max_steps": 1000000000, "batch": 8, "slots": 4, "dim": 32, "hdim": 64, "lr": 0.001, "warmup": 50, "pred_w": 1.0, "sep_w": 0.1, "warp_w": 1.0, "log_every": 50, "threads": 0}
+数据：训练 1200 条 × 24 步，测试 200 条（63s）；底座回差 0.30~5.77°
