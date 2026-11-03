@@ -116,7 +116,7 @@ class GraspTask:
         c = self.cfg
         if base_deg is not None:
             self.base_deg = max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, base_deg))
-        self.arm.move({**c.POSES["observe"], c.BASE_ID: self.base_pulse(), c.CLAW_ID: c.CLAW_OPEN},
+        self.arm.move({**c.POSES["observe"], c.BASE_ID: self.base_pulse(), c.CLAW_ID: c.observe_claw()},
                       c.ARM_MOVE_MS)
 
     # ------------------------------------------------ 搜索

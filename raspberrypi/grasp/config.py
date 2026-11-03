@@ -170,6 +170,14 @@ BASE_ID = 6
 BASE_CENTER = 1500        # [标定] 底座朝正前方时的脉宽（arm.txt 里初始姿态是 1500）
 CLAW_OPEN = 500           # arm.txt：张爪 500
 CLAW_CLOSE = 1478         # arm.txt：合爪 1478（"抓住"）
+# 观察 / 对准时爪子的状态："open" 张开（原来的做法）、"close" 合上。
+# 张开时爪子的一只脚会伸进画面，K230 的跟踪器可能把它当成物块锁住；合上能躲开的话用 "close"
+# （抓取时会先张爪再伸出，不受影响）
+OBSERVE_CLAW = "open"
+
+
+def observe_claw():
+    return CLAW_CLOSE if OBSERVE_CLAW == "close" else CLAW_OPEN
 POSES = {
     # 上电姿态：机械臂板一上电、树莓派发指令之前舵机所在的位置（固件 PWM.c 里 ServoPwmDuty 的初值）。
     # 原固件是 3/4/5 = 500（收拢），但 4 号在 500 顶到机械限位会抖。用 `calib.py jog power_on` 找一个
@@ -226,7 +234,7 @@ CALIB_FILE = _os.environ.get("GRASP_CALIB_FILE") or     _os.path.join(_os.path.d
 CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "GOAL", "TOL", "R_CAM_MM", "BASE_DIR", "BASE_CENTER", "BASE_US_PER_DEG", "CLAW_OPEN", "CLAW_CLOSE",
     "REACH_NEAR_D", "REACH_FAR_D", "POSES_CALIBRATED", "ACK_MIN_RADIUS_MM", "K230_ROTATE", "LIFT_MAX_CM",
-    "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "SEARCH_LOOK_FIRST", "REACH_MARGIN_MM", "GOAL_FAR", "GHOST_CHECK", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
+    "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "SEARCH_LOOK_FIRST", "REACH_MARGIN_MM", "GOAL_FAR", "GHOST_CHECK", "OBSERVE_CLAW", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
     "ARM_SLOW_MS", "STEP_ALPHA",
     "CHASSIS_STOP_MODEL", "CHASSIS_CMD_LATENCY_S", "CHASSIS_PI_TAU_S", "CHASSIS_REF_VOLTAGE_V",
     "CHASSIS_CMD_TTL_S", "CHASSIS_YAW_TRIM_DEG_PER_M",

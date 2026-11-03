@@ -94,7 +94,9 @@ def arm_move(pulses, ms=1000, quiet=False):
 
 def pose_pulses(name, base_pulse=None):
     pulses = {cfg.BASE_ID: base_pulse if base_pulse is not None else cfg.BASE_CENTER, **cfg.POSES[name]}
-    if name in ("observe", "ready"):
+    if name == "observe":
+        pulses[cfg.CLAW_ID] = cfg.observe_claw()
+    elif name == "ready":
         pulses[cfg.CLAW_ID] = cfg.CLAW_OPEN
     return pulses
 
