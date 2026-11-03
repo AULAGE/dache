@@ -238,6 +238,66 @@ class TestStopSignals(unittest.TestCase):
         self.assertGreater(vx, 0)
 
 
+class TestReopenAndSerialErrors(unittest.TestCase):
+    """报告 [报错退出-1]（修复）：一直抓模式下串口异常 / 重开失败直接带堆栈退出"""
+
+    def test_serial_exception_mid_run_reopens(self):
+        import main
+        # pyserial 的 SerialException 是 OSError，不是 DeviceError：改之前直接冲出 run_real，程序退出
+        with RunRealHarness(main, [FakeSerialException("device reports readiness to read but returned no data"),
+                                   "ok"]) as h:
+            main.run_real(once=False, step=False, force=False)
+        self.assertEqual(h.opens, 2)
+        self.assertIn("lift.stop", h.closed)
+
+    def test_reopen_failure_retries(self):
+        import main
+        with RunRealHarness(main, [devices.DeviceError("机械臂 USB 掉线"), "ok"],
+                            open_fail=[None, FakeSerialException("No such file"),
+                                       devices.DeviceError("机械臂串口打不开"), None]) as h:
+            main.run_real(once=False, step=False, force=False)
+        self.assertEqual(h.opens, 4, "重开失败两次后第三次成功，接着抓")
+
+    def test_first_open_failure_still_raises(self):
+        import main
+        with RunRealHarness(main, ["ok"], open_fail=[devices.DeviceError("机械臂串口打不开")]):
+            with self.assertRaises(devices.DeviceError):
+                main.run_real(once=False, step=False, force=False)
+
+    def test_open_devices_closes_partial(self):
+        import main
+        log = []
+
+        class Cam:
+            def __init__(self, *a, **k):
+                log.append("cam.open")
+                self.ser = types.SimpleNamespace(close=lambda: log.append("cam.ser.close"))
+
+            def close(self):
+                log.append("cam.close")
+
+        class LiftF(Cam):
+            def __init__(self, *a, **k):
+                log.append("lift.open")
+                self.ser = types.SimpleNamespace(close=lambda: log.append("lift.ser.close"))
+
+            def stop(self):
+                log.append("lift.stop")
+
+        def arm_fail(*a, **k):
+            raise devices.DeviceError("机械臂串口打不开")
+        saved = main.K230, main.Lift, main.Arm
+        main.K230, main.Lift, main.Arm = Cam, LiftF, arm_fail
+        try:
+            with self.assertRaises(devices.DeviceError):
+                main.open_devices(devices.RealClock())
+        finally:
+            main.K230, main.Lift, main.Arm = saved
+        self.assertIn("cam.close", log)            # K230 读线程停掉，重开时不会两个线程抢一个串口
+        self.assertIn("cam.ser.close", log)
+        self.assertIn("lift.ser.close", log)
+
+
 def wheeltec_fb(vx=0, volt_mv=25000, flag=0):
     f = bytearray(24)
     f[0], f[1] = 0x7B, flag

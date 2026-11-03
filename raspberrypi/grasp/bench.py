@@ -161,7 +161,7 @@ class RealRig:
             self.main.close_devices(self.devs or [])
             self.devs = None
             raise
-        except DeviceError as e:                       # 含手柄接管（ManualOverride）
+        except (DeviceError, OSError) as e:            # 含手柄接管（ManualOverride）、串口异常（SerialException）
             kind = "manual" if isinstance(e, ManualOverride) else "device_error"
             print(("手柄接管：" if kind == "manual" else "设备错误：") + str(e))
             self.main.close_devices(self.devs or [])

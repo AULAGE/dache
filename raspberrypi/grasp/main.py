@@ -114,13 +114,21 @@ def chassis_options(c):
 
 
 def open_devices(clock):
-    cam = K230(cfg.PORTS["k230"], cfg.BAUD["k230"], clock, cfg.TARGET_TIMEOUT_S, cfg.K230_ROTATE)
-    lift = Lift(cfg.PORTS["lift"], cfg.BAUD["lift"], cfg.LIFT_MAX_CM)
-    arm = Arm(cfg.PORTS["arm"], cfg.BAUD["arm"], clock, robust=cfg.ARM_USB_ROBUST)
-    chassis = WheeltecChassis(cfg.PORTS["chassis"], cfg.BAUD["chassis"], cfg.CHASSIS_SPEED_MM_S,
-                              cfg.ACK_MIN_RADIUS_MM, cfg.CHASSIS_ACKERMANN,
-                              os.path.join(LOG_DIR, "chassis_tau.json"), **chassis_options(cfg)) \
-        if cfg.USE_CHASSIS else NullChassis()
+    opened = []         # 中途打开失败：把已经打开的关掉（否则重开时旧的 K230 读线程还在抢串口数据）
+    try:
+        cam = K230(cfg.PORTS["k230"], cfg.BAUD["k230"], clock, cfg.TARGET_TIMEOUT_S, cfg.K230_ROTATE)
+        opened.append(cam)
+        lift = Lift(cfg.PORTS["lift"], cfg.BAUD["lift"], cfg.LIFT_MAX_CM)
+        opened.append(lift)
+        arm = Arm(cfg.PORTS["arm"], cfg.BAUD["arm"], clock, robust=cfg.ARM_USB_ROBUST)
+        opened.append(arm)
+        chassis = WheeltecChassis(cfg.PORTS["chassis"], cfg.BAUD["chassis"], cfg.CHASSIS_SPEED_MM_S,
+                                  cfg.ACK_MIN_RADIUS_MM, cfg.CHASSIS_ACKERMANN,
+                                  os.path.join(LOG_DIR, "chassis_tau.json"), **chassis_options(cfg)) \
+            if cfg.USE_CHASSIS else NullChassis()
+    except BaseException:
+        close_devices(opened)
+        raise
     return cam, lift, arm, chassis
 
 
@@ -344,7 +352,14 @@ def run_real(once, step, force, record=False):
                 time.sleep(1.0)
                 continue
             if devs is None:
-                devs = open_devices(clock)
+                try:
+                    devs = open_devices(clock)
+                except (DeviceError, OSError) as e:     # 串口暂时不在（USB 重新枚举中）：一直抓模式下等一会再开
+                    if not checked or once:
+                        raise
+                    print("重开设备失败：", e, "，3 秒后再试")
+                    time.sleep(3)
+                    continue
                 if not checked:
                     problems = preflight(*devs)
                     checked = True
@@ -361,7 +376,7 @@ def run_real(once, step, force, record=False):
                 print("设备复位：", e)
                 print(RESET_HINT)
                 return
-            except DeviceError as e:
+            except (DeviceError, OSError) as e:      # OSError：pyserial 的 SerialException（USB 掉线等）
                 print("设备错误：", e)
                 close_devices(devs)
                 devs = None
