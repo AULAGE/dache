@@ -732,6 +732,158 @@ def test_ghost():
         cfg.USE_CHASSIS = saved
 
 
+# ------------------------------------------------------------ 试验记录工具 bench.py（任务 08）
+def test_bench():
+    print("试验记录工具 bench.py（仿真设备 + 假的用户输入）")
+    import io
+    import contextlib
+    import csv as _csv
+    import config as cfg
+    import main
+    import bench
+    from sim import SIM_POSES, make_sim
+
+    saved = (cfg.POSES, cfg.USE_CHASSIS, main.RealClock, main.ManualGuard, main.open_devices, main.preflight)
+    tmp = tempfile.mkdtemp(prefix="bench_test_")
+    path = os.path.join(tmp, "bench.csv")
+    try:
+        cfg.POSES = SIM_POSES
+        cfg.USE_CHASSIS = False
+
+        # ---- 位置说明：左 = 负角度（底座右转为正），深度取 REACH_NEAR_D / REACH_FAR_D
+        ps = bench.positions()
+        check("9 个位置：④ 中·左是负角度、⑥ 中·右是正角度、⑤ 正前方",
+              ps[3]["angle_deg"] < 0 < ps[5]["angle_deg"] and ps[4]["angle_deg"] == 0
+              and "往左" in ps[3]["text"] and "正前方" in ps[4]["text"])
+        check("近 / 远深度取自标定", ps[0]["depth_mm"] == round(min(cfg.REACH_NEAR_D, cfg.REACH_FAR_D))
+              and ps[8]["depth_mm"] == round(max(cfg.REACH_NEAR_D, cfg.REACH_FAR_D)))
+        check("--positions 解析（含 ⑤ 写法）", bench.parse_positions("2,5，⑧") == [2, 5, 8])
+        check("偏差输入解析", bench.parse_dev("右4 前") == [("右", 4.0), ("前", None)]
+              and bench.parse_dev("r3.5") == [("右", 3.5)] and bench.parse_dev("不知道") == [])
+
+        # ---- 用仿真设备代替真机，跑 RealRunner（和 main.py 真机同一套代码）
+        state = {"world": None, "devs": None, "seed": 100}
+        stops = []
+
+        def new_world(runner=None):
+            state["seed"] += 1
+            world, clock, cam, lift, arm, ch = make_sim(cfg, state["seed"], 1.0, cfg.R_CAM_MM)
+            lift.stop = lambda: stops.append(1)
+            state["world"], state["devs"] = world, (cam, lift, arm, ch)
+            if runner is not None:
+                runner.clock = clock
+                if runner.task is not None:
+                    runner.task.clock = clock
+                    runner.task.base_deg = 0.0
+                if runner.devs is not None:
+                    runner.set_devices(state["devs"])
+            return clock
+
+        clock0 = new_world()
+        runner = main.RealRunner(clock=clock0, guard=types.SimpleNamespace(active=False),
+                                 opener=lambda c: state["devs"], check=lambda *d: [], log_dir=tmp)
+
+        def user(interrupt_at=None):
+            seen = {"start": 0}
+
+            def ask(prompt=""):
+                if "回车开始" in prompt:
+                    seen["start"] += 1
+                    if interrupt_at and seen["start"] == interrupt_at:
+                        raise KeyboardInterrupt
+                    new_world(runner)          # 用户摆了一个新物块
+                    return ""
+                if "真的抓到" in prompt:
+                    return "y" if state["world"].picked else "n"   # 照实回答
+                if "偏哪边" in prompt:
+                    return "右4"
+                return ""
+            return ask
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            n = bench.run_bench(runner, bench.make_plan([5, 1], 1), path, ask=user(), round_id="R1")
+        rows = bench.read_rows(path)
+        check("每次测完写一行 bench.csv，列齐全", n == 2 and len(rows) == 2
+              and list(rows[0].keys()) == bench.FIELDS, f"{n} 次")
+        check("记录了位置、程序结果、真实结果", [r["pos"] for r in rows] == ["5", "1"]
+              and all(r["result"] and r["truth"] in ("0", "1") for r in rows),
+              "；".join(f"{r['pos']}:{r['result']}/{r['truth']}" for r in rows))
+        g = [r for r in rows if r["d"]]
+        check("伸出时的物块位置、底座、升降轴、插值 t、微调都记下了",
+              g and all(r["x_deg"] and r["base_deg"] and r["lift_cm"] and r["t"] and r["trim_deg"] for r in g)
+              and all(r["steps"] and r["time_s"] for r in rows))
+        bad = [r for r in rows if r["truth"] == "0" and r["d"]]
+        check("没抓到的记了偏差（右为正）", all(r["dev_lr_mm"] == "4.0" and r["dev_dirs"] == "右" for r in bad))
+
+        # ---- Ctrl+C：中途中断，已完成的已写入；main() 那层负责急停（这里直接调 close）
+        path2 = os.path.join(tmp, "bench2.csv")
+        try:
+            with contextlib.redirect_stdout(buf):
+                bench.run_bench(runner, bench.make_plan([1, 2, 3], 1), path2, ask=user(interrupt_at=2),
+                                round_id="R2")
+            check("Ctrl+C 中途退出", False)
+        except KeyboardInterrupt:
+            runner.close()
+            check("Ctrl+C 中途退出：已完成的 1 次已保存、升降轴急停",
+                  len(bench.read_rows(path2)) == 1 and stops and runner.devs is None)
+        rid, left = bench.resume_plan(path2, bench.make_plan([1, 2, 3], 1))
+        check("--resume 从没测的位置继续", rid == "R2" and left == [2, 3], f"{rid} {left}")
+        with contextlib.redirect_stdout(buf):
+            bench.run_bench(runner, left, path2, ask=user(), round_id=rid)
+        rows2 = bench.read_rows(path2)
+        check("续测后同一轮 3 个位置都齐了（设备被重新打开）",
+              sorted(r["pos"] for r in rows2) == ["1", "2", "3"] and {r["round"] for r in rows2} == {"R2"})
+        rid, left = bench.resume_plan(path2, bench.make_plan([1, 2, 3], 1))
+        check("上一轮测完了 → --resume 开新一轮", rid is None and left == [1, 2, 3])
+
+        # ---- report：合成数据看建议
+        def fake(path_, recs):
+            for i, (p, res, truth, lr) in enumerate(recs):
+                bench.append_row(path_, {"round": "R", "pos": p, "row": bench.ROWS[(p - 1) // 3],
+                                         "col": bench.COLS[(p - 1) % 3], "depth_mm": 180, "result": res,
+                                         "truth": truth, "dev_dirs": ("右" if lr and lr > 0 else "左" if lr else ""),
+                                         "dev_lr_mm": lr, "trim_deg": 0.0})
+
+        p3 = os.path.join(tmp, "r_most.csv")
+        fake(p3, [(p, "success", 0, 4.0) for p in (1, 2, 4, 5, 7, 8)] + [(p, "success", 1, None) for p in range(1, 10)])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            sug = bench.report(p3)
+        txt = out.getvalue()
+        check("多数位置偏右 4mm → 建议 calib.py trim 4", any("calib.py trim 4" in s for s in sug), "；".join(sug))
+        check("误报统计进混淆表和建议", "误报" in txt and any("误报成功 6 次" in s for s in sug))
+        p4 = os.path.join(tmp, "r_right.csv")
+        fake(p4, [(p, "grasp_failed", 0, 5.0) for p in (3, 6, 9)] + [(p, "success", 1, None) for p in range(1, 10)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            sug = bench.report(p4)
+        check("只有右侧位置偏右 → 提示底座回差 / 任务 09", any("右侧" in s and "任务 09" in s for s in sug)
+              and not any("calib.py trim 5" in s for s in sug), "；".join(sug))
+
+        # ---- main.py 真机流程（重构成 RealRunner 后）行为不变：--once 跑一次、检查不过不启动
+        main.RealClock = lambda: new_world()
+        main.ManualGuard = lambda pat: types.SimpleNamespace(active=False)
+        main.open_devices = lambda c: state["devs"]
+        saved_log = main.LOG_DIR
+        main.LOG_DIR = tmp
+        try:
+            main.preflight = lambda *d: []
+            with contextlib.redirect_stdout(buf):
+                main.run_real(True, False, False)
+            eps = list(_csv.DictReader(open(os.path.join(tmp, "episodes.csv"), encoding="utf-8")))
+            check("main.run_real(--once)：跑一次就停", len(eps) >= 1 and eps[-1]["result"], eps[-1]["result"])
+            main.preflight = lambda *d: ["K230 没数据"]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                main.run_real(True, False, False)
+            check("main.run_real：启动前检查没通过 → 不启动",
+                  "检查没通过，不启动" in out.getvalue()
+                  and len(list(_csv.DictReader(open(os.path.join(tmp, "episodes.csv"), encoding="utf-8")))) == len(eps))
+        finally:
+            main.LOG_DIR = saved_log
+    finally:
+        cfg.POSES, cfg.USE_CHASSIS, main.RealClock, main.ManualGuard, main.open_devices, main.preflight = saved
+
+
 # ------------------------------------------------------------ 仿真回归
 def test_sim():
     print("仿真回归（整套流程）")
@@ -763,7 +915,7 @@ if __name__ == "__main__":
     quick = len(sys.argv) > 1 and sys.argv[1] == "quick"
     real_serial = devices.serial
     for t in (test_arm, test_k230, test_lift, test_chassis, test_chassis_fw, test_calib_override,
-              test_step_and_guard, test_geometry, test_ghost, test_sim_factors):
+              test_step_and_guard, test_geometry, test_ghost, test_sim_factors, test_bench):
         try:
             t()
         except Exception as e:

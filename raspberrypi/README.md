@@ -77,6 +77,7 @@ K230 ──串口──►                ┌──► 升降轴 STM32（伺服�
 | `grasp/main.py` | 入口：`--check` 自检、`--sim` 仿真、真机运行（`--step` 单步、`--no-chassis`） |
 | `grasp/selftest.py` | 离线自测：假下位机测所有驱动（底盘按固件源码复现）+ 几何前馈 + 仿真回归（48 项）。改完代码先跑它 |
 | `grasp/chassis_test.py` | 底盘停车精度真机测试：走 ±100mm 各 3 次打印误差、航向漂移（`--model`、`--ruler`、`--timeout-check`），见 `docs/cloud_tasks/results/03_报告.md` |
+| `grasp/bench.py` | 真机试验记录：引导放位置 → 自动抓 → 你确认真实结果 → `logs/bench.csv`；`bench.py report` 按位置统计 + 调参建议 |
 | `grasp/report.py` | 看日志：成功率、步数趋势、某次抓取的逐步误差/动作，并给出诊断提示 |
 | `grasp/task.py` | 任务流程：搜索 → 对准 → 抓取 → 确认 → 放置 |
 | `grasp/servo.py` | 自适应视觉伺服 |
@@ -131,6 +132,24 @@ python3 main.py --once --step --no-chassis   # 物块放在臂展内；每个动
 **8. 加上底盘**：物块放远一点（30~60cm），`python3 main.py --once --step` → 没问题再去掉 `--step`
 
 出问题时：`python3 report.py`（最近一次的每一步 + 自动诊断）、`logs/run_*.log`（完整输出）。
+
+**9. 测试矩阵：记录真实结果**（程序报的"抓到了"不算数，要人看）
+```bash
+python3 bench.py                     # 9 个位置（近/中/远 × 左/中/右）各 2 次，默认不用底盘
+python3 bench.py --positions 2,5,8   # 只测这几个位置；--repeat 3 每个位置 3 次；--chassis 用底盘；--step 单步
+python3 bench.py --resume            # 中途 Ctrl+C 退出了，从没测的位置接着测
+python3 bench.py report              # 按位置的真实成功率、误报、偏差方向 + 调参建议（--last 只看最近一轮）
+```
+- 每次它会提示把物块放到哪（例如"⑤ 中·中：离相机约 18.6cm、正前方"；"左"是底座往左转、负角度），回车后自动抓一次
+  （和 `main.py --once` 同一套代码），然后问：**真的抓到了吗**（`y`/`n`，`x` = 这次不算重来）→ 没抓到时问爪子偏哪边、
+  偏几毫米（可以一次写 `右4 前3`；前 = 落点比物块离车更远）→ 备注
+- `bench.py report` 的建议怎么用：
+  - "多数位置偏右约 4mm → `calib.py trim 4`"：照做（可累加），然后再测一轮
+  - "只有右侧位置偏右 → 底座回差（任务 09）"：先别 trim
+  - "远处偏高 → `calib.py teach far`"、"只有中间深度偏 → reach_mid（任务 09）"
+  - "程序误报成功"：把对应时间的 `logs/run_*.log` 发给我
+- 改了 trim 以后建议开新一轮，并用 `bench.py report --last` 只看新的一轮（不同 trim 的数据混在一起会互相抵消）
+- 一轮结束后把 `python3 report.py` 和 `python3 bench.py report` 两份输出一起发给我
 
 **注意**
 - 物块放在离车 **90cm 以内**：24mm 的物块再远 K230 识别不出来（仿真里"没找到"的全是这种情况）

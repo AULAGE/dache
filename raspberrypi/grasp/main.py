@@ -267,50 +267,100 @@ def run_check():
 
 
 # ============================================================ 真机运行
+class PreflightFailed(Exception):
+    """启动前检查没通过（且没加 --force）"""
+
+
+class RealRunner:
+    """
+    真机"跑一次抓取"的公共部分：打开设备、启动前检查（只做一次）、手柄接管时让出串口、设备出错时关掉等下次重开。
+    main.py（一直抓 / --once）和 bench.py（试验记录）共用，抓取逻辑都在 GraspTask.run_once 里。
+    clock / guard / opener / check 留给离线自测替换成仿真设备，平时不用传。
+    """
+
+    def __init__(self, step=False, force=False, clock=None, guard=None, opener=None, check=None,
+                 log_dir=None):
+        self.step, self.force, self.log_dir = step, force, log_dir or LOG_DIR
+        self.clock = clock or RealClock()
+        if guard is None:
+            guard = ManualGuard(cfg.MANUAL_PROCESS)
+            time.sleep(1.2)                  # 等手柄检测线程第一次查完
+        self.guard = guard
+        self.opener = opener or open_devices
+        self.check = check or preflight
+        self.devs = None
+        self.task = None
+        self.checked = False
+
+    def set_devices(self, devs):
+        """换上一套（新打开的）设备；任务对象保留（学到的灵敏度、episode 编号接着用）"""
+        self.devs = devs
+        cam, lift, arm, chassis = devs
+        if self.step:
+            lift, arm, chassis = (StepProxy(lift, "升降轴"), StepProxy(arm, "机械臂"),
+                                  StepProxy(chassis, "底盘"))
+        if self.task is None:
+            self.task = GraspTask(cfg, self.clock, cam, lift, arm, chassis, log_dir=self.log_dir,
+                                  guard=self.guard)
+        else:
+            self.task.cam, self.task.lift, self.task.arm, self.task.chassis = cam, lift, arm, chassis
+
+    def attempt(self):
+        """
+        跑一次 GraspTask.run_once，返回它的结果行。
+          返回 None：手柄接管中（已让出串口，等了 1 秒）或任务被手柄打断，调用方再调一次即可
+          抛 PreflightFailed：第一次打开设备时启动前检查没通过
+          抛 DeviceError：设备出错（设备已关闭，下次调用会重新打开）
+        """
+        if self.guard.active:
+            if self.devs:
+                close_devices(self.devs)          # 让出串口给手柄程序
+                self.devs = None
+                print("手柄接管中，串口已释放，等待手柄断开……")
+            time.sleep(1.0)
+            return None
+        if self.devs is None:
+            devs = self.opener(self.clock)
+            if not self.checked:
+                problems = self.check(*devs)
+                self.checked = True
+                if problems and not self.force:
+                    close_devices(devs)
+                    raise PreflightFailed(f"有 {len(problems)} 项检查没通过，不启动（确认安全的话可以加 --force 跳过）")
+            self.set_devices(devs)
+        try:
+            return self.task.run_once()
+        except ManualOverride as e:
+            print(e)
+            return None
+        except DeviceError as e:
+            print("设备错误：", e)
+            self.close()
+            raise
+
+    def close(self):
+        """关闭设备（升降轴急停、底盘停车）"""
+        if self.devs:
+            close_devices(self.devs)
+            self.devs = None
+
+
 def run_real(once, step, force):
-    clock = RealClock()
-    guard = ManualGuard(cfg.MANUAL_PROCESS)
-    time.sleep(1.2)
-    task = None
-    devs = None
-    checked = False
+    runner = None
     try:
+        runner = RealRunner(step, force)
         while True:
-            if guard.active:
-                if devs:
-                    close_devices(devs)          # 让出串口给手柄程序
-                    devs = None
-                    print("手柄接管中，串口已释放，等待手柄断开……")
-                time.sleep(1.0)
-                continue
-            if devs is None:
-                devs = open_devices(clock)
-                if not checked:
-                    problems = preflight(*devs)
-                    checked = True
-                    if problems and not force:
-                        print(f"有 {len(problems)} 项检查没通过，不启动（确认安全的话可以加 --force 跳过）")
-                        return
-                cam, lift, arm, chassis = devs
-                if step:
-                    lift, arm, chassis = (StepProxy(lift, "升降轴"), StepProxy(arm, "机械臂"),
-                                          StepProxy(chassis, "底盘"))
-                if task is None:
-                    task = GraspTask(cfg, clock, cam, lift, arm, chassis, log_dir=LOG_DIR, guard=guard)
-                else:
-                    task.cam, task.lift, task.arm, task.chassis = cam, lift, arm, chassis
             try:
-                r = task.run_once()
-            except ManualOverride as e:
+                r = runner.attempt()
+            except PreflightFailed as e:
                 print(e)
-                continue
-            except DeviceError as e:
-                print("设备错误：", e)
-                close_devices(devs)
-                devs = None
+                return
+            except DeviceError:
                 if once:
                     raise
                 time.sleep(3)
+                continue
+            if r is None:
                 continue
             if once:
                 break
@@ -319,8 +369,8 @@ def run_real(once, step, force):
     except KeyboardInterrupt:
         print("\n手动停止：升降轴急停、底盘停车")
     finally:
-        if devs:
-            close_devices(devs)
+        if runner is not None:
+            runner.close()
 
 
 if __name__ == "__main__":
