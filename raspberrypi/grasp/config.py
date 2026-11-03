@@ -154,9 +154,15 @@ SEARCH_LIFT_CM_NEAR = [25, 15, 35, 5, 45]
 SEARCH_BASE_DEG_NEAR = [0, -30, 30, -60, 60]
 SEARCH_LOOK_FIRST = True         # 搜索前先原地看一眼（不动升降轴/底座），看到就直接对准
 SEARCH_BACKOFF_MM = 250          # 都没找到：底盘后退这么多再搜一遍（物块太近时上下视野太窄会漏掉）
+# 任务 18：找到目标以前搜索累计最多后退多少（mm，跨多次抓取累计，找到目标清零）。原来没有上限：
+# main.py 连续运行、周围没有物块时每次都退 250mm，一直倒下去（仿真 6 次退了 1.5m）。0 = 不限（原行为）
+SEARCH_BACKOFF_MAX_MM = 500
 # 误识别过滤（任务 02 仿真发现）：搜索时第一次看到目标，原地再测 1~2 次，位置一致才采信。
 # False = 原行为（看到就采信）。打开后每次找到目标多花约 1 秒
 SEARCH_CONFIRM = False
+# 任务 18：有底盘时搜索到的目标一律复核（不管 SEARCH_CONFIRM）。仿真：不复核时 K230 偶尔的误识别会让底盘
+# 朝空处一步开 400mm，有时开到物块跟前（离底座转轴只剩 60mm，真机会撞平台）。无底盘不受影响；False = 原行为
+SEARCH_CONFIRM_CHASSIS = True
 CONFIRM_D_MM = 30.0              # 两次测量深度 / y 差不超过 max(这个值, 深度 × CONFIRM_D_FRAC)
 CONFIRM_D_FRAC = 0.15
 CONFIRM_X_DEG = 3.0              # 方位角差不超过这个值
@@ -207,6 +213,13 @@ REACH_MID_D = None
 GOAL_MID = None
 # 对准时动了执行器、读数却几乎不变（< 30% 预期），连续 2 次 → 判定 K230 识别到的是机械臂自己，停止
 GHOST_CHECK = True
+# 任务 18：有底盘时也查深度轴：底盘走了一段（按里程预测深度该变 ≥ 30mm）读数却几乎不变，连续 2 次 → ghost，停。
+# 不加这一项时爪子被当成物块会让底盘一直开（仿真：25 步 5m）。只影响有底盘的情况；False = 原行为
+GHOST_CHECK_D = True
+# 任务 18：底盘走完一步后，深度读数的变化和里程差太多（> max(这个值, 里程的一半)）→ 原地再确认一次目标，
+# 确认不了按丢失处理。原来照着跳变的读数再开一大步，仿真里开过了物块。只影响有底盘的情况；False = 原行为
+CHASSIS_JUMP_CHECK = True
+CHASSIS_JUMP_D_MM = 80.0
 # ghost 指纹（任务 10）：GHOST_CHECK 判定 ghost 时，把当时的读数（x_deg、y、d）记到 logs/ghosts.json；
 # 之后测到和某个指纹很接近的读数（各轴都在 GHOST_FP_TOL 内）就当作没看到，并提示"看到的是之前记录的假目标"。
 # 爪子相对相机不动，所以它的读数和机械臂姿态无关，记一次以后都认得出。
@@ -282,7 +295,8 @@ CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "CHASSIS_STOP_MODEL", "CHASSIS_CMD_LATENCY_S", "CHASSIS_PI_TAU_S", "CHASSIS_REF_VOLTAGE_V",
     "CHASSIS_CMD_TTL_S", "CHASSIS_YAW_TRIM_DEG_PER_M",
     "ARM_USB_ROBUST", "SEARCH_CONFIRM", "CONFIRM_D_MM", "CONFIRM_D_FRAC", "CONFIRM_X_DEG",
-    "BASE_LIMIT_BACKUP_MM",
+    "BASE_LIMIT_BACKUP_MM", "GHOST_CHECK_D", "SEARCH_CONFIRM_CHASSIS", "SEARCH_BACKOFF_MAX_MM",
+    "CHASSIS_JUMP_CHECK", "CHASSIS_JUMP_D_MM", "SEARCH_BASE_DEG",
     "BASE_BACKLASH_DEG", "BASE_APPROACH_DIR", "BASE_MIN_STEP_DEG", "GRASP_PROBE_MM", "GRASP_PROBE_FIRST",
     "TRIM_LEARN", "TRIM_LEARN_RATE", "TRIM_MAX_DEG", "TRIM_LEARN_EDGES", "REACH_MID_D", "GOAL_MID",
     "GHOST_FINGERPRINT", "GHOST_FP_TOL", "GHOST_FP_MIN_HITS", "GHOST_FP_MAX",

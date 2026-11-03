@@ -38,6 +38,7 @@ class GraspTask:
         self.log_dir = log_dir
         self.episode = 0
         self.base_deg = 0.0
+        self.backoff_mm = 0.0            # 任务 18：上次找到目标以后，搜索一共后退了多少（跨多次抓取累计）
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
         # 任务 09：底座消回差要记住最后一次发给底座的脉宽和转动方向（None / 0 = 不知道）
@@ -265,6 +266,7 @@ class GraspTask:
                 m = self.confirm_target(m)
             if m:
                 self.say("搜索：原地就看到了目标")
+                self.backoff_mm = 0.0
                 return m
         turns = [0] + (list(c.SEARCH_CHASSIS_TURNS) if self.can_turn else [])
         bases = list(c.SEARCH_BASE_DEG if c.USE_CHASSIS else c.SEARCH_BASE_DEG_NEAR)
@@ -273,6 +275,13 @@ class GraspTask:
         turned = 0.0
         for r in range(rounds):
             if r:
+                cap = c.SEARCH_BACKOFF_MAX_MM
+                if cap and self.backoff_mm + c.SEARCH_BACKOFF_MM > cap:
+                    # 连续好几次都没找到（例如物块都抓完了）：main.py 一直循环，每次都退 250mm 会一直倒下去
+                    self.say(f"搜索：没找到；找到目标以前已经累计后退 {self.backoff_mm:.0f}mm，"
+                             f"不再后退（上限 SEARCH_BACKOFF_MAX_MM={cap}）")
+                    break
+                self.backoff_mm += c.SEARCH_BACKOFF_MM
                 self.say(f"搜索：没找到，后退 {c.SEARCH_BACKOFF_MM}mm 再搜")
                 self.set_base(0)
                 back = (turned + 180.0) % 360.0 - 180.0      # 转回原方向，走最短的一边
@@ -290,10 +299,11 @@ class GraspTask:
                     for b in bases:
                         self.set_base(b)
                         m = self.measure()
-                        if m and c.SEARCH_CONFIRM:
+                        if m and (c.SEARCH_CONFIRM or (c.USE_CHASSIS and c.SEARCH_CONFIRM_CHASSIS)):
                             m = self.confirm_target(m)
                         if m:
                             self.say(f"搜索：找到目标（高度 {h}cm，底座 {b:+.0f}°）")
+                            self.backoff_mm = 0.0
                             return m
                     bases.reverse()          # 下一轮反向扫，少转一大圈
         return None
@@ -322,7 +332,7 @@ class GraspTask:
         """闭环对准。返回 (是否对准, 最后一次测量, 用了几步)"""
         c = self.cfg
         self._abort = None
-        strikes = {"y": 0, "x_deg": 0}          # 连续几次"动了但读数几乎没变"
+        strikes = {"y": 0, "x_deg": 0, "d": 0}  # 连续几次"动了但读数几乎没变"
         for step in range(c.MAX_ALIGN_STEPS):
             if m is None:
                 self.say("对准：目标丢失")
@@ -353,6 +363,7 @@ class GraspTask:
                 u_d = self.axes["d"].command(e["d"], s_d)
 
             base_old = self.base_deg
+            moved = 0.0                     # 底盘这一步实际走了多少（mm，里程计）
             base_want = base_old + u_x
             base_new = max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, base_want))
             u_x = base_new - base_old
@@ -417,6 +428,17 @@ class GraspTask:
             far = any(abs(e[k]) > 4 * c.TOL[k] for k in self.axis_names)
             m2 = self.measure(c.SAMPLE_N_FAR if far else None)
 
+            if m2 is not None and c.CHASSIS_JUMP_CHECK and abs(moved) > 0:
+                # 任务 18：底盘走完以后，深度变化和里程对不上（例如往前走了 287mm，深度反而大了 153mm）→
+                # 多半是误识别 / 跟踪器换了目标。原来直接照着新读数再开一大步，仿真里开过了物块（会撞平台）。
+                # 再确认一次：确认不了就当丢失，回去重新搜索
+                want = e["d"] + self.axes["d"].j * math.cos(math.radians(base_old)) * moved
+                got = m2.err(goal)["d"]
+                if abs(got - want) > max(c.CHASSIS_JUMP_D_MM, 0.5 * abs(moved)):
+                    self.say(f"对准：底盘走了 {moved:+.0f}mm，深度误差应约 {want:+.0f}mm，读到 {got:+.0f}mm，"
+                             f"对不上（可能是误识别），再确认一次")
+                    m2 = self.confirm_target(m2)
+
             if m2 is not None and c.GHOST_CHECK:
                 e2 = m2.err(goal)
                 checks = []
@@ -424,11 +446,17 @@ class GraspTask:
                     checks.append(("y", self.axes["y"].j * u_y, e2["y"] - e["y"], max(6.0, 3 * NOISE["y"])))
                 if u_x and not recenter and not u_d:
                     checks.append(("x_deg", self.axes["x_deg"].j * s_x * u_x, e2["x_deg"] - e["x_deg"], 1.5))
+                if u_d and c.GHOST_CHECK_D:
+                    # 任务 18：底盘走了一段、深度读数却几乎不变 → 也是 ghost（原来开车时不查，
+                    # 爪子被当成物块时底盘会一步步一直开，仿真 25 步走了 5m）。按实际里程预测，
+                    # 底座偏得多时深度本来就变得少（cos），预测量小于阈值就不查
+                    pred = self.axes["d"].j * math.cos(math.radians(base_old)) * moved
+                    checks.append(("d", pred, e2["d"] - e["d"], max(30.0, 3 * NOISE["d"])))
                 for ax, pred, got, thresh in checks:
                     if abs(pred) >= thresh:
                         strikes[ax] = strikes[ax] + 1 if abs(got) < 0.3 * abs(pred) else 0
                 if max(strikes.values()) >= 2:
-                    what = "升降轴" if strikes["y"] >= 2 else "底座"
+                    what = "升降轴" if strikes["y"] >= 2 else ("底座" if strikes["x_deg"] >= 2 else "底盘")
                     self.say(f"对准：{what}动了两次，物块的读数几乎没变 → K230 识别到的很可能是机械臂自己"
                              f"（例如爪子），停止。请在 IDE 画面里看识别框框在哪")
                     self._abort = "ghost"

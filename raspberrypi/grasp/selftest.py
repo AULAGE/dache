@@ -4,7 +4,7 @@
 改完代码先跑它，全部 ✅ 再上真机。
 
   python3 selftest.py          全部测试（约 1 分钟）
-  python3 selftest.py quick    跳过耗时的仿真回归
+  python3 selftest.py quick    跳过耗时的仿真回归（任务 18 的底盘危险动作检查照样跑）
   python3 selftest.py research 全部测试 + 研究原型（research/，任务 11）的单元测试
 """
 import importlib
@@ -1241,6 +1241,15 @@ def test_sim():
         main.cfg = cfg
 
 
+# ------------------------------------------------------------ 底盘联调预演（任务 18，test_chassis_rehearsal.py）
+def test_chassis_rehearsal(full=False):
+    import test_chassis_rehearsal as tcr
+    tcr.PASS, tcr.FAIL = PASS, FAIL          # 结果计入 selftest 的统计
+    tcr.quick()
+    if full:
+        tcr.stats(40)
+
+
 # ------------------------------------------------------------ 研究原型（可选，任务 11）
 def test_research():
     print("研究原型 research/（任务 11，仿真）")
@@ -1266,6 +1275,12 @@ if __name__ == "__main__":
             check(f"{t.__name__} 崩溃", False, repr(e))
         finally:
             devices.serial = real_serial
+    try:
+        test_chassis_rehearsal(full=not quick)
+    except Exception as e:
+        check("test_chassis_rehearsal 崩溃", False, repr(e))
+    finally:
+        devices.serial = real_serial
     if not quick:
         test_sim()
     if research:

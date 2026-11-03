@@ -17,6 +17,7 @@
 """
 import argparse
 import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -106,6 +107,21 @@ def run_sim(n, seed, learn, no_chassis=False):
 
 
 # ============================================================ 真机设备
+def install_stop_signals():
+    """
+    任务 18：SIGTERM（systemctl stop grasp、kill）和 SIGHUP（SSH 断开）默认会让 Python 直接退出，
+    finally 和 atexit 都不执行，底盘停车帧发不出去 —— 固件没有串口超时，车会按最后的速度一直走。
+    改成和 Ctrl+C 一样抛 KeyboardInterrupt，走正常的停车 / 关设备流程。kill -9 和断电仍然拦不住。
+    """
+    def stop(signum, frame):
+        raise KeyboardInterrupt(f"收到信号 {signal.Signals(signum).name}")
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, stop)
+
+
 def chassis_options(c):
     """config.py 里底盘驱动的可调参数（chassis_test.py 也用）"""
     return dict(stop_model=c.CHASSIS_STOP_MODEL, cmd_latency_s=c.CHASSIS_CMD_LATENCY_S,
@@ -185,21 +201,6 @@ class Tee:
 
     def flush(self):
         self.out.flush()
-
-
-def install_stop_signals():
-    """
-    systemctl stop（SIGTERM）、SSH 断开（SIGHUP）默认直接结束进程，不走 finally / atexit：
-    底盘固件没有串口超时，最后一帧速度会一直保持；升降轴也收不到急停。
-    改成和 Ctrl+C 一样抛 KeyboardInterrupt，走原来的停车流程（任务 17 审查）
-    """
-    import signal
-
-    def _stop(signum, frame):
-        raise KeyboardInterrupt(f"收到信号 {signum}")
-    for name in ("SIGTERM", "SIGHUP"):
-        if hasattr(signal, name):
-            signal.signal(getattr(signal, name), _stop)
 
 
 def manual_running():
