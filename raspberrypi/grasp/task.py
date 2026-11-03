@@ -192,7 +192,8 @@ class GraspTask:
             if m is None:
                 self.say("对准：目标丢失")
                 return False, None, step
-            e = m.err(c.GOAL)
+            goal = self.goal_for(m)
+            e = m.err(goal)
             if self.in_tol(e):
                 return True, m, step
 
@@ -262,7 +263,7 @@ class GraspTask:
             m2 = self.measure(c.SAMPLE_N_FAR if far else None)
 
             if m2 is not None and self.learn:
-                e2 = m2.err(c.GOAL)
+                e2 = m2.err(goal)
                 # 只学习没有被别的动作干扰的轴
                 if u_y:
                     self.axes["y"].learn(u_y, e["y"], e2["y"])
@@ -283,6 +284,7 @@ class GraspTask:
     def grasp(self, m):
         """伸出 → 合爪 → 抬升；返回是否确认抓到"""
         c = self.cfg
+        self._grasp_ref = m
         t = (m.d - c.REACH_NEAR_D) / (c.REACH_FAR_D - c.REACH_NEAR_D)
         if not 0 <= t <= 1 and not c.REACH_RANGE_OK:
             raise DeviceError(f"物块深度 {m.d:.0f}mm 超出机械臂范围")
@@ -311,6 +313,21 @@ class GraspTask:
             self.say("确认：无法判断，按成功处理")
             return True
         return ok
+
+    def goal_for(self, m):
+        """
+        对准目标。没有底盘时深度没法对准，物块在近/远两个标定姿态之间时，
+        目标的 Y 和方位角也要按深度插值（物块越远，在画面里越靠上），否则升降轴会对到错误的高度。
+        有底盘时底盘会把深度对到 GOAL，用固定的 GOAL。
+        """
+        c = self.cfg
+        g, gf = c.GOAL, getattr(c, "GOAL_FAR", None)
+        if c.USE_CHASSIS or not gf or m is None or gf["d"] == g["d"]:
+            return g
+        t = max(0.0, min(1.0, (m.d - g["d"]) / (gf["d"] - g["d"])))
+        return {"x_deg": g["x_deg"] + (gf["x_deg"] - g["x_deg"]) * t,
+                "y": g["y"] + (gf["y"] - g["y"]) * t,
+                "d": m.d}                         # 深度不对准（够不够得着由 reachable 判断）
 
     def reach_range(self):
         """机械臂（不靠底盘）能抓到的物块深度范围 (近, 远)，单位 mm"""
@@ -352,7 +369,9 @@ class GraspTask:
         观察确认：爪子保持闭合，退回观察姿态、升降轴降回抓取时的高度，看原来的位置还有没有物块。
         还在（和 GOAL 差不多的位置）= 没抓到；不在 = 抓到了。
         """
-        c, g = self.cfg, self.cfg.GOAL
+        c = self.cfg
+        ref = getattr(self, "_grasp_ref", None)    # 对准时实际看到的物块位置（没有就用 GOAL）
+        g = {"x_deg": ref.x_deg, "y": ref.y, "d": ref.d} if ref is not None else c.GOAL
         self.arm.move({**c.POSES["observe"], c.BASE_ID: bp}, c.ARM_MOVE_MS)     # 爪子不动
         self.lift.move_by(-c.LIFT_AFTER_GRASP_CM)
         self._lifted = False
@@ -406,7 +425,7 @@ class GraspTask:
             ok, m_al, n = self.align(m)
             steps += n
             if m_al is not None:
-                last_err = m_al.err(c.GOAL)
+                last_err = m_al.err(self.goal_for(m_al))
             if not ok:
                 result = "lost" if m_al is None else "align_failed"
                 self.go_observe()

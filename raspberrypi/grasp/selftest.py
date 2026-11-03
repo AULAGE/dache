@@ -561,6 +561,24 @@ def test_geometry():
     finally:
         cfg.GOAL.update(g0)
 
+    # 没有底盘时目标按深度插值（2026-11-03 真机标定：近 156mm Y=70，远 216mm Y=43）
+    saved = (cfg.USE_CHASSIS, getattr(cfg, "GOAL_FAR", None), dict(cfg.GOAL))
+    try:
+        cfg.USE_CHASSIS = False
+        cfg.GOAL.update({"x_deg": -7.33, "y": 70.0, "d": 155.5})
+        cfg.GOAL_FAR = {"x_deg": -7.4, "y": 43.0, "d": 215.5}
+        g = t.goal_for(devices.Measurement(0, 0, 185.5, 5))
+        check("无底盘：目标 Y 按深度插值（186mm → Y≈56.5）", abs(g["y"] - 56.5) < 0.01 and abs(g["d"] - 185.5) < 1e-9,
+              f"{g}")
+        g = t.goal_for(devices.Measurement(0, 0, 300, 5))
+        check("无底盘：超出远端时按远端目标", abs(g["y"] - 43.0) < 1e-9)
+        cfg.USE_CHASSIS = True
+        check("有底盘：用固定 GOAL", t.goal_for(devices.Measurement(0, 0, 185.5, 5)) is cfg.GOAL)
+    finally:
+        cfg.USE_CHASSIS, cfg.GOAL_FAR = saved[0], saved[1]
+        cfg.GOAL.clear()
+        cfg.GOAL.update(saved[2])
+
 
 # ------------------------------------------------------------ 仿真真实度（任务 02 新增的因素）
 def test_sim_factors():

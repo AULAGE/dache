@@ -318,8 +318,8 @@ def teach():
             return
         x, y, d, xd, _ = m
         upd = {"REACH_NEAR_D" if which == "reach_near" else "REACH_FAR_D": round(d)}
-        if which == "reach_near":
-            upd["GOAL"] = {"x_deg": round(xd, 2), "y": round(y, 1), "d": round(d, 1)}
+        g_here = {"x_deg": round(xd, 2), "y": round(y, 1), "d": round(d, 1)}
+        upd["GOAL" if which == "reach_near" else "GOAL_FAR"] = g_here
         if ask(f"保存 {upd}？[y/N] ") == "y":
             save_calib(upd)
 
