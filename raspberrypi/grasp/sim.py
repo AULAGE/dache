@@ -25,6 +25,12 @@
   6 SIM_ARM_USB_DROP_P 机械臂 CH340 偶尔掉线 0.5~2s，走真机同一套 Arm.move 重连逻辑
   7 SIM_FALSE_TARGET_P 偶尔出现假目标，持续几帧
 新因素都用独立的随机数流，关掉某一项时其余随机序列基本不变，方便逐项对比。
+
+任务 09 新增（默认全关，原来的仿真结果不变；python3 sim_accuracy.py 打开它们对比）：
+  8 SIM_GRASP_BIAS_MM  每台车固定的爪子落点横向偏差（偏右为正），SIM_GRASP_BIAS_VAR_MM 让它随深度变；
+                       SIM_GRIP_TOL_MM 横向抓取容差（mm，代替原来的 3°）
+  9 SIM_REACH_SHIFT    伸出时机械臂重心外移，把底座推到回差间隙的一侧（每台车固定哪一侧）
+  10 SIM_REACH_SAG_MM  两点关节插值在中间深度时爪子高度偏（抛物线，t=0.5 处最大）
 """
 import math
 import random
@@ -87,10 +93,17 @@ class SimClock:
 def make_car(cfg, seed):
     """每台车固定的未知量（新因素用），和每次抓取的场景无关"""
     r = random.Random(seed * 7919 + 17)
-    return {
+    car = {
         "box_bias_px": r.uniform(-1, 1) * _c(cfg, "SIM_BOX_BIAS_PX", 1.0),   # 框边长固定偏差（颜色精修边界）
         "coast_tau": _c(cfg, "SIM_CHASSIS_TAU_S", 0.45) * r.uniform(0.9, 1.1),
     }
+    # 任务 09（排在后面抽，前面两项的值不变）
+    b = _c(cfg, "SIM_GRASP_BIAS_MM", 0.0)
+    lo, hi = b if isinstance(b, (tuple, list)) else (b, b)
+    car["grasp_bias_mm"] = r.uniform(lo, hi)                             # 落点偏差（偏右为正）
+    car["grasp_bias_var_mm"] = r.uniform(-1, 1) * _c(cfg, "SIM_GRASP_BIAS_VAR_MM", 0.0)   # 近→远变化量
+    car["reach_side"] = 1 if r.random() < 0.5 else -1                    # 伸出时底座被推向回差间隙的哪一侧
+    return car
 
 
 class World:
@@ -716,9 +729,50 @@ class SimArm:
         x, y, d = w.measured_clean(v)
         g = c.GOAL
         ex = math.degrees(math.atan2(x, d)) - g["x_deg"]
+        if self._lateral_mode():
+            lat, tol = self._lateral(ex, d)
+            en = max(abs(lat) / tol, abs(y + self._height_err(d) - g["y"]) / self.GRIP_TOL["y"],
+                     abs(d - g["d"]) / self.GRIP_TOL["d"] if c.USE_CHASSIS else 0.0)
+            return en, lat
         en = max(abs(ex) / self.GRIP_TOL["x_deg"], abs(y - g["y"]) / self.GRIP_TOL["y"],
                  abs(d - g["d"]) / self.GRIP_TOL["d"] if c.USE_CHASSIS else 0.0)
         return en, ex
+
+    # ---------------- 任务 09：落点偏差 / 横向容差 / 中间深度高度偏差
+    def _lateral_mode(self):
+        car = self.w.car
+        return (_c(self.cfg, "SIM_GRIP_TOL_MM", 0.0) > 0 or car.get("grasp_bias_mm", 0.0) != 0.0
+                or car.get("grasp_bias_var_mm", 0.0) != 0.0 or _c(self.cfg, "SIM_REACH_SAG_MM", 0.0) > 0)
+
+    def grasp_bias(self, d):
+        """这台车在深度 d（K230 读数）时爪子落点相对"对准位置"偏右多少 mm"""
+        c, car = self.cfg, self.w.car
+        mid = (c.REACH_NEAR_D + c.REACH_FAR_D) / 2.0
+        half = max(abs(c.REACH_FAR_D - c.REACH_NEAR_D) / 2.0, 1.0)
+        k = max(-1.0, min(1.0, (d - mid) / half))
+        return car.get("grasp_bias_mm", 0.0) + car.get("grasp_bias_var_mm", 0.0) * k
+
+    def _lateral(self, ex_deg, d):
+        """物块中心相对爪子落点的横向偏差（mm，物块偏右为正）和横向容差"""
+        tol = _c(self.cfg, "SIM_GRIP_TOL_MM", 0.0) or d * math.tan(math.radians(self.GRIP_TOL["x_deg"]))
+        return d * math.tan(math.radians(ex_deg)) - self.grasp_bias(d), tol
+
+    def _height_err(self, d):
+        """
+        中间深度爪子高度偏差（mm）：假设"刚好抓到"需要的 3 号舵机脉宽随深度是一条抛物线
+        p(t) = near + (far − near)·t − sag·4t(1−t)（1us ≈ 1mm 高度），程序发的是插值出来的脉宽。
+        两点插值 → 中间偏 sag；标了 reach_mid（= p(t_mid)）后三点分段插值，偏差变小
+        """
+        sag = _c(self.cfg, "SIM_REACH_SAG_MM", 0.0)
+        p3 = getattr(self, "reach_p3", None)
+        if sag <= 0 or p3 is None or self.w.pose != "reach":
+            return 0.0
+        c = self.cfg
+        near, far = c.POSES["reach_near"][3], c.POSES["reach_far"][3]
+        t = (d - c.REACH_NEAR_D) / (c.REACH_FAR_D - c.REACH_NEAR_D)
+        t = max(0.0, min(1.0, t))
+        p_true = near + (far - near) * t - sag * 4 * t * (1 - t) * (1 if far < near else -1)
+        return abs(p3 - p_true)
 
     def _maybe_push(self):
         """4 机械臂伸出时爪子蹭到物块：有小偏差时有概率把物块推开"""
@@ -742,14 +796,23 @@ class SimArm:
         """控制板收到一帧：舵机开始动（状态立即生效，相机在动作时间内的帧按插值 + 模糊）"""
         c, w = self.cfg, self.w
         w.touch(ms / 1000.0 + 0.15)
+        entering_reach = False
         if 3 in pulses:
             new_pose = pose_of(pulses[3])
             if new_pose == "reach" and w.pose != "reach":
                 self._maybe_push()
+                entering_reach = True
+            if new_pose == "reach":
+                self.reach_p3 = pulses[3]
             w.pose = new_pose
         if c.BASE_ID in pulses:
             out = self._servo_base(pulses[c.BASE_ID])
             w.base_deg = (out - c.BASE_CENTER) / (c.BASE_US_PER_DEG * c.BASE_DIR)
+        if entering_reach and _c(c, "SIM_REACH_SHIFT", False):
+            # 9 机械臂伸出去、重心外移：底座输出轴被推到回差间隙的一侧
+            bl = _c(c, "SIM_SERVO_BACKLASH_US", 0)
+            self.base_out = self.base_motor + w.car.get("reach_side", 1) * bl / 2.0
+            w.base_deg = (self.base_out - c.BASE_CENTER) / (c.BASE_US_PER_DEG * c.BASE_DIR)
         claw = pulses.get(c.CLAW_ID)
         if claw == c.CLAW_CLOSE and not w.held:
             v = w.true_view("observe", fov=False)
@@ -759,8 +822,14 @@ class SimArm:
             g = c.GOAL
             ok_d = abs(d - g["d"]) <= self.GRIP_TOL["d"] if c.USE_CHASSIS else \
                 c.REACH_NEAR_D - 10 <= d <= c.REACH_FAR_D + 10
-            ok = (abs(math.degrees(math.atan2(x, d)) - g["x_deg"]) <= self.GRIP_TOL["x_deg"]
-                  and abs(y - g["y"]) <= self.GRIP_TOL["y"] and ok_d)
+            if self._lateral_mode():        # 任务 09：按毫米算横向偏差（含落点偏差），高度加上插值误差
+                lat, tol = self._lateral(math.degrees(math.atan2(x, d)) - g["x_deg"], d)
+                self.last_lateral_mm = lat
+                ok = (abs(lat) <= tol and abs(y + self._height_err(d) - g["y"]) <= self.GRIP_TOL["y"]
+                      and ok_d)
+            else:
+                ok = (abs(math.degrees(math.atan2(x, d)) - g["x_deg"]) <= self.GRIP_TOL["x_deg"]
+                      and abs(y - g["y"]) <= self.GRIP_TOL["y"] and ok_d)
             if ok and self.rng.random() < 0.9:
                 w.held_view = w.true_view("reach", fov=False)
                 w.held = True

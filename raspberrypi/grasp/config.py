@@ -99,6 +99,12 @@ SIM_ARM_USB_DROP_S = (0.5, 2.0)  # 掉线多久（实测会这样）
 SIM_ARM_USB_SILENT_P = 0.3     #   掉线那一帧已写进缓冲区、没报错但丢了的比例（估计）
 SIM_FALSE_TARGET_P = 0.005     # 7 每帧冒出一个假目标的概率（约 30 秒一次，估计）
 SIM_FALSE_TARGET_FRAMES = (2, 5)  # 假目标持续几帧
+# 任务 09 新增（默认全关，保证原来的仿真结果不变；python3 sim_accuracy.py 会打开它们做对比）
+SIM_GRASP_BIAS_MM = 0.0        # 8 爪子落点横向偏差（mm，偏右为正）：(lo, hi) = 每台车在这个范围里随机固定一个值；0 = 关
+SIM_GRASP_BIAS_VAR_MM = 0.0    #   偏差随深度变：近→远线性变化 ±这么多（每台车随机方向；模拟爪子脚遮挡随位置变，估计）
+SIM_GRIP_TOL_MM = 0.0          #   横向抓取容差 ±mm：爪子张开约 36mm、物块 24mm → (36−24)/2 = 6（估计）；0 = 用原来的 3°
+SIM_REACH_SHIFT = False        # 9 伸出时机械臂重心外移，把底座推到回差间隙的一侧（每台车固定哪一侧，估计）
+SIM_REACH_SAG_MM = 0.0         # 10 两点关节插值在中间深度的爪子高度偏差（t=0.5 处 mm，抛物线，两端为 0）；0 = 关
 
 # ======================= 对准目标 =======================
 # [标定] 机械臂在 observe 姿态时，把物块放到"机械臂伸出去刚好能抓到"的位置，
@@ -195,12 +201,36 @@ REACH_FAR_D = 200.0
 REACH_RANGE_OK = True     # 深度超出这个范围时仍尝试（姿态截断到边界）
 # reach_far 那次 teach 时观察姿态下看到的物块位置（calib.py teach 自动保存）；没有底盘时目标按深度在 GOAL 和它之间插值
 GOAL_FAR = None
+# 可选的中间伸出姿态（任务 09，calib.py teach mid 标定）：POSES["reach_mid"] + 它对应的物块深度 + 当时看到的物块位置。
+# 标了就按 近-中-远 三点分段插值（伸出姿态和无底盘时的对准目标都是）；没标（None）= 两点插值，原行为
+REACH_MID_D = None
+GOAL_MID = None
 # 对准时动了执行器、读数却几乎不变（< 30% 预期），连续 2 次 → 判定 K230 识别到的是机械臂自己，停止
 GHOST_CHECK = True
 # 升降轴到最低/最高点后，剩余高度误差（K230 读数 mm）不超过这个值就照样去抓（爪子张开时上下能兜住一点）
 LIFT_LIMIT_SLACK_MM = 15.0
 # 左右微调（度，底座右转为正）：对准后爪子落点系统性偏右就填负数，往左补。用 `calib.py trim <偏右毫米>` 设置
 GRASP_BASE_TRIM_DEG = 0.0
+
+# —— 任务 09：抓取精度（全部默认关 = 原行为；原理和仿真对比见 docs/cloud_tasks/results/09_报告.md，未在真机验证）——
+# 底座消回差：底座要往"逼近方向"的反方向转时，先多转这么多度再转回来，保证最后一段总是从同一方向逼近
+# （LDX-218 有回差：从左边转到 10° 和从右边转到 10° 停的位置不一样）。0 = 关
+BASE_BACKLASH_DEG = 0.0
+BASE_APPROACH_DIR = 1     # 最后一段从哪边逼近：1 = 最后一段是右转，-1 = 最后一段是左转
+# 底座最小有效步长（度）：方位角误差超过容差、算出来的步子比这个小时，按这个值走（越过死区）。
+# 不会走到"冲出容差另一边"：步子最多到预测误差 = −0.9×容差。0 = 关
+BASE_MIN_STEP_DEG = 0.0
+# 失败后左右试探：没抓到重试时，落点在微调基础上依次偏 ∓p 毫米（换算成底座角度），而不是原样再抓。0 = 关
+GRASP_PROBE_MM = 0.0
+# 第一次试探先往哪边："left" 先左、"right" 先右、"alternate" 每次抓取轮换（打开 TRIM_LEARN 时用这个，防止学偏）
+GRASP_PROBE_FIRST = "alternate"
+# 从结果学习落点偏差（要同时打开 GRASP_PROBE_MM）：按物块深度分 3 段，每段一个微调值，存 logs/learned_trim.json。
+#   试探成功 → 这一段的微调往成功的方向挪 TRIM_LEARN_RATE × 试探量；直接成功 → 不变；都失败 → 只记录
+TRIM_LEARN = False
+TRIM_LEARN_RATE = 0.5
+TRIM_MAX_DEG = 3.0        # 学到的微调幅度上限（±度，另外加在 GRASP_BASE_TRIM_DEG 上）
+TRIM_LEARN_EDGES = None   # 深度分段边界（mm），例如 [176, 196]；None = 把 [REACH_NEAR_D, REACH_FAR_D] 三等分
+TRIM_LEARN_FILE = "learned_trim.json"
 REACH_MARGIN_MM = 25      # 没有底盘时：物块深度超出 [REACH_NEAR_D, REACH_FAR_D]（或只标了一个姿态时 GOAL 深度）±这么多就不抓
 ARM_MOVE_MS = 1000        # 一般动作时间（arm.txt 里每帧都是 1000ms）
 ARM_SLOW_MS = 1200        # 伸向物块时放慢
@@ -244,6 +274,8 @@ CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "CHASSIS_CMD_TTL_S", "CHASSIS_YAW_TRIM_DEG_PER_M",
     "ARM_USB_ROBUST", "SEARCH_CONFIRM", "CONFIRM_D_MM", "CONFIRM_D_FRAC", "CONFIRM_X_DEG",
     "BASE_LIMIT_BACKUP_MM",
+    "BASE_BACKLASH_DEG", "BASE_APPROACH_DIR", "BASE_MIN_STEP_DEG", "GRASP_PROBE_MM", "GRASP_PROBE_FIRST",
+    "TRIM_LEARN", "TRIM_LEARN_RATE", "TRIM_MAX_DEG", "TRIM_LEARN_EDGES", "REACH_MID_D", "GOAL_MID",
 }
 
 
