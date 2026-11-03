@@ -76,7 +76,8 @@ K230 ──串口──►                ┌──► 升降轴 STM32（伺服�
 | `grasp/calib.py` | 标定工具：watch / goal / jog / auto / teach …… |
 | `grasp/main.py` | 入口：`--check` 自检、`--sim` 仿真、真机运行（`--step` 单步、`--no-chassis`） |
 | `grasp/selftest.py` | 离线自测：假下位机测所有驱动（底盘按固件源码复现）+ 几何前馈 + 仿真回归 + bench.py。改完代码先跑它 |
-| `grasp/chassis_test.py` | 底盘停车精度真机测试：走 ±100mm 各 3 次打印误差、航向漂移（`--model`、`--ruler`、`--timeout-check`），见 `docs/cloud_tasks/results/03_报告.md` |
+| `grasp/chassis_test.py` | 底盘真机测试：`--voltage` 只读、`--hang` 架空三种停车、`--ruler [--write]` ±100/±200mm 精度并拟合滑行 τ、`--radius [--write]` 最小转弯半径、`--timeout-check`。分步说明见 `docs/底盘联调手册.md` |
+| `grasp/test_chassis_rehearsal.py` | 有底盘联调预演（仿真）：物块车前 300~700mm 的成功率 / 里程 / 后退 / 危险动作统计 + 危险动作回归测试（selftest 会调用） |
 | `grasp/bench.py` | **真机试验记录**：按测试矩阵（近/中/远 × 左/中/右）提示放物块 → 自动抓 → 问你真的抓到没有、偏哪边 → 记到 `logs/bench.csv`；`bench.py report` 按位置统计并给出调参建议 |
 | `grasp/recorder.py` | **论文数据记录**：`main.py --record` 时记录每条动作命令和 K230 每一帧；`recorder.py backlash/pairs` 离线分析回差、抽样本对。测试 `test_recorder.py` |
 | `grasp/report.py` | 看日志：成功率、步数趋势、某次抓取的逐步误差/动作，并给出诊断提示 |
@@ -130,7 +131,7 @@ python3 calib.py show            # 看一眼所有标定结果
 python3 main.py --once --step --no-chassis   # 物块放在臂展内；每个动作前打印要做什么，回车才执行，q 停止
 ```
 **7. 放开单步**：`python3 main.py --once --no-chassis`
-**8. 加上底盘**：物块放远一点（30~60cm），`python3 main.py --once --step` → 没问题再去掉 `--step`
+**8. 加上底盘**：先按 `docs/底盘联调手册.md` 做完架空、直走、转弯半径、防撞平台检查，再 `python3 main.py --once --step` → 没问题再去掉 `--step`
 
 出问题时：`python3 report.py`（最近一次的每一步 + 自动诊断）、`logs/run_*.log`（完整输出）。
 
