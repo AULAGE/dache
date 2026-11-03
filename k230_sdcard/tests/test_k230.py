@@ -516,6 +516,233 @@ class TestMisc(unittest.TestCase):
               % (res[False] * 1e3, res[True] * 1e3, res[False] / res[True]), end=" ")
 
 
+# ====================================================================== 忽略区域（任务 10）
+class _RecOSD:
+    def __init__(self):
+        self.lines = []
+
+    def draw_line(self, x1, y1, x2, y2, **k):
+        self.lines.append((x1, y1, x2, y2))
+
+
+def run_frames(m, frames, rects):
+    """按主循环的顺序（过滤 -> select -> update -> 区域检查）跑一串帧，返回每帧确认后跟踪框的中心（没有为 None）"""
+    t = m.Tracker()
+    out = []
+    for dets in frames:
+        dets, _ = m.filter_ignored(list(dets), rects)
+        d, matched = t.select(dets, 0.35, 0.19, lambda bb: None)
+        if d is not None:
+            box = [d[2], d[3], d[4], d[5]]
+            t.update(d, matched, box, None, False, None, 140)
+        else:
+            t.mark_missed()
+        if rects and m.tracker_in_ignore(t, rects):
+            t.reset()
+        if t.confirmed():
+            s = t.smooth
+            out.append(((s[0] + s[2]) / 2, (s[1] + s[3]) / 2))
+        else:
+            out.append(None)
+    return out
+
+
+def box_at(cx, cy, side):
+    return [cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2]
+
+
+class TestIgnoreRegions(unittest.TestCase):
+    def test_defaults(self):
+        """默认打开、标定模式关；默认区域在画面左侧中间，面积约 1/60 ~ 1/30"""
+        m = k230_stub.load_main()
+        self.assertTrue(m.IGNORE_REGIONS_ENABLE)
+        self.assertFalse(m.IGNORE_CALIB_MODE)
+        self.assertTrue(m.IGNORE_REGIONS)
+        for (u1, v1, u2, v2) in m.IGNORE_REGIONS:
+            self.assertTrue(0 <= u1 < u2 <= 1 and 0 <= v1 < v2 <= 1)
+        u1, v1, u2, v2 = m.IGNORE_REGIONS[0]
+        self.assertLessEqual(u2, 0.25)                      # 左侧
+        self.assertLess(v1, 0.5)                            # 竖直方向包住中间
+        self.assertGreater(v2, 0.5)
+        area = (u2 - u1) * (v2 - v1)
+        self.assertTrue(1 / 60.0 <= area <= 1 / 30.0, area)
+
+    def test_unrotate_is_inverse_of_rotate(self):
+        for deg in (0, 90, 270):
+            m = k230_stub.load_main(ROTATE_DEG=deg)
+            m.ROTATED = deg in (90, 270)
+            for _ in range(30):
+                x, y = random.uniform(0, FW), random.uniform(0, FH)
+                px, py = m.rotate_point(x, y, FW, FH)
+                bx, by = m.unrotate_point(px, py, FW, FH)
+                self.assertAlmostEqual(bx, x)
+                self.assertAlmostEqual(by, y)
+
+    def test_region_to_raw_pixels_rot90(self):
+        """固定换算：ROTATE_DEG=90 时，显示画面 (左, 上, 右, 下) = (u1, v1, u2, v2) 对应
+        原始 1280x720 的 x ∈ [v1·1280, v2·1280]、y ∈ [(1-u2)·720, (1-u1)·720]
+        —— 也就是说显示画面的"左边"是原始画面的"下边"（y 大）"""
+        m = k230_stub.load_main()
+        r = m.ignore_region_to_raw((0.00, 0.40, 0.12, 0.60), FW, FH)
+        for a, b in zip(r, (512.0, 633.6, 768.0, 720.0)):
+            self.assertAlmostEqual(a, b, places=6)
+        # 反过来：原始画面底边中间的点，在显示画面里是左侧中间
+        u, v = m.raw_to_disp_norm(640, 700, FW, FH)
+        self.assertAlmostEqual(u, 20 / 720.0)
+        self.assertAlmostEqual(v, 0.5)
+        # 显示画面右上角 (1, 0) -> 原始左上角 (0, 0)
+        r = m.ignore_region_to_raw((0.9, 0.0, 1.0, 0.1), FW, FH)
+        for a, b in zip(r, (0.0, 0.0, 128.0, 72.0)):
+            self.assertAlmostEqual(a, b, places=6)
+
+    def test_region_roundtrip_all_rotations(self):
+        """任意区域：换算到原始像素后，区域内（外）的随机点换回显示归一化坐标仍在区域内（外）"""
+        rng = random.Random(3)
+        for deg in (0, 90, 270):
+            m = k230_stub.load_main(ROTATE_DEG=deg)
+            m.ROTATED = deg in (90, 270)
+            for _ in range(10):
+                u1, u2 = sorted(rng.uniform(0, 1) for _ in range(2))
+                v1, v2 = sorted(rng.uniform(0, 1) for _ in range(2))
+                rect = m.ignore_region_to_raw((u1, v1, u2, v2), FW, FH)
+                for _ in range(40):
+                    x, y = rng.uniform(0, FW), rng.uniform(0, FH)
+                    u, v = m.raw_to_disp_norm(x, y, FW, FH)
+                    inside = u1 + 1e-9 < u < u2 - 1e-9 and v1 + 1e-9 < v < v2 - 1e-9
+                    outside = u < u1 - 1e-9 or u > u2 + 1e-9 or v < v1 - 1e-9 or v > v2 + 1e-9
+                    if inside:
+                        self.assertTrue(m.in_ignore(x, y, [rect]), (deg, u, v))
+                    elif outside:
+                        self.assertFalse(m.in_ignore(x, y, [rect]), (deg, u, v))
+
+    def test_left_middle_box_reads_negative_x(self):
+        """显示画面左侧中间的框，发出去的 X 为负（左）、Y 约为 0 —— 用来对照真机 ghost 读数（见报告）"""
+        m = k230_stub.load_main(USE_UNDISTORT=False)
+        cx, cy = m.unrotate_point(0.06 * FH, 0.5 * FW, FW, FH)
+        p = m.compute_position(box_at(cx, cy, 60), FW, FH, 24.0)
+        self.assertLess(p['x_mm'], 0)
+        self.assertLess(abs(p['y_mm']), 1.0)
+
+    def test_filter_drops_only_centers_inside(self):
+        m = k230_stub.load_main()
+        rects = m.ignore_rects_raw(FW, FH)
+        self.assertEqual(len(rects), 1)
+        foot = det(box_at(640, 690, 50))                  # 中心在区域里（框本身伸出区域也算）
+        edge = det(box_at(640, 600, 80))                  # 框碰到区域、中心在外面 -> 保留
+        block = det(box_at(640, 300, 90))
+        kept, n = m.filter_ignored([foot, edge, block], rects)
+        self.assertEqual(n, 1)
+        self.assertEqual(kept, [edge, block])
+        # 关掉开关 -> 没有忽略矩形，什么都不丢
+        m2 = k230_stub.load_main(IGNORE_REGIONS_ENABLE=False)
+        self.assertEqual(m2.ignore_rects_raw(FW, FH), [])
+        kept, n = m2.filter_ignored([foot, block], m2.ignore_rects_raw(FW, FH))
+        self.assertEqual((kept, n), ([foot, block], 0))
+        self.assertEqual(m.filter_ignored([], rects), ([], 0))
+
+    def test_tracker_never_locks_claw_foot(self):
+        """
+        只有爪子脚（分数还更高）+ 一个物块：不忽略时跟踪器锁住爪子脚；忽略后锁住物块。
+        物块从画面里消失时，不忽略会转去锁爪子脚，忽略后就是"没有目标"（只发心跳）
+        """
+        m = k230_stub.load_main()
+        rects = m.ignore_rects_raw(FW, FH)
+        foot = det(box_at(640, 690, 50), score=0.9)
+        block = det(box_at(500, 300, 70), score=0.6)
+        frames = [[foot, block]] * 6 + [[foot]] * 12
+        on = run_frames(m, frames, rects)
+        off = run_frames(m, frames, [])
+        self.assertTrue(all(c is not None and m.in_ignore(c[0], c[1], rects) for c in off[1:6]))
+        self.assertTrue(all(c is not None and abs(c[0] - 500) < 1 for c in on[1:6]))
+        self.assertTrue(all(c is None for c in on[-4:]))
+        self.assertTrue(all(c is not None and m.in_ignore(c[0], c[1], rects) for c in off[-4:]))
+
+    def test_locked_target_dropped_when_entering_region(self):
+        """已经锁定的目标一步步移进区域：中心一进区域立即放弃，之后不会再锁上"""
+        m = k230_stub.load_main()
+        rects = m.ignore_rects_raw(FW, FH)
+        frames = [[det(box_at(640, 500 + 10 * k, 50))] for k in range(20)]   # y 从 500 走到 690（区域 y>=633.6）
+        out = run_frames(m, frames, rects)
+        locked = [c for c in out if c is not None]
+        self.assertTrue(locked)
+        self.assertTrue(all(not m.in_ignore(c[0], c[1], rects) for c in locked))
+        self.assertTrue(all(c is None for c in out[-5:]))
+        # 丢帧保持中：预测框（按速度外推）进入区域也立即放弃，不用等 LOST_TOLERANCE 帧
+        t = m.Tracker()
+        for k in range(8):
+            b = box_at(640, 560 + 8 * k, 50)
+            t.update(det(b), k > 0, b, None, False, None, 140)
+        self.assertFalse(m.tracker_in_ignore(t, rects))
+        n = 0
+        while not m.tracker_in_ignore(t, rects) and n < m.LOST_TOLERANCE:
+            t.mark_missed()
+            n += 1
+        self.assertTrue(m.tracker_in_ignore(t, rects))
+        self.assertLess(n, m.LOST_TOLERANCE)
+
+    def test_tracker_in_ignore(self):
+        m = k230_stub.load_main()
+        rects = m.ignore_rects_raw(FW, FH)
+        t = m.Tracker()
+        self.assertFalse(m.tracker_in_ignore(t, rects))
+        b = box_at(640, 690, 50)
+        t.update(det(b), False, b, None, False, None, 140)
+        self.assertTrue(m.tracker_in_ignore(t, rects))
+        self.assertFalse(m.tracker_in_ignore(t, []))
+
+    def test_osd_dashed_region(self):
+        """OSD 虚线框：线段都在区域边上、在 OSD 范围内，并覆盖一半以上的周长"""
+        m = k230_stub.load_main()
+        segs, labels = m.ignore_osd_segments(m.OSD_W, m.OSD_H)
+        self.assertEqual(len(labels), len(m.IGNORE_REGIONS))
+        u1, v1, u2, v2 = m.IGNORE_REGIONS[0]
+        x1, y1 = int(u1 * m.OSD_W), int(v1 * m.OSD_H)
+        x2, y2 = int(u2 * m.OSD_W), int(v2 * m.OSD_H)
+        total = 0.0
+        for (xa, ya, xb, yb) in segs:
+            for x, y in ((xa, ya), (xb, yb)):
+                self.assertTrue(0 <= x < m.OSD_W and 0 <= y < m.OSD_H)
+                self.assertTrue(x1 - 1 <= x <= x2 + 1 and y1 - 1 <= y <= y2 + 1)
+                self.assertTrue(abs(x - x1) <= 1 or abs(x - x2) <= 1 or abs(y - y1) <= 1 or abs(y - y2) <= 1)
+            total += math.hypot(xb - xa, yb - ya)
+        perim = 2 * ((x2 - x1) + (y2 - y1))
+        self.assertGreater(total, 0.5 * perim)
+        self.assertLess(total, perim + 1)
+        # 主循环画虚线用的 osd 方法 _NullOSD 也要有
+        rec = _RecOSD()
+        for s in segs:
+            rec.draw_line(*s, color=(255, 0, 0), thickness=2)
+            m._NULL_OSD.draw_line(*s, color=(255, 0, 0), thickness=2)
+        self.assertEqual(len(rec.lines), len(segs))
+
+    def test_calib_mode_output(self):
+        m = k230_stub.load_main()
+        rects = m.ignore_rects_raw(FW, FH)
+        cal = m.IgnoreCalib(FW, FH, 200)
+        foot = det(box_at(640, 690, 50), score=0.71)
+        block = det(box_at(640, 300, 90), score=0.8)
+        txt = cal.feed([foot, block], rects, ["red"], 1000)
+        self.assertIn("[IGN-CAL]", txt)
+        self.assertEqual(txt.count("[忽略]"), 1)
+        self.assertIn("red 0.71", txt)
+        u, v, w, h, ign = cal.describe(foot, rects)
+        self.assertTrue(ign)
+        self.assertAlmostEqual(u, 30 / 720.0)
+        self.assertAlmostEqual(v, 0.5)
+        self.assertAlmostEqual(w, 50 / 720.0)
+        self.assertAlmostEqual(h, 50 / 1280.0)
+        self.assertIsNone(cal.feed([foot], rects, ["red"], 1100))    # 没到打印间隔
+        self.assertIsNotNone(cal.feed([], rects, ["red"], 1300))
+        self.assertEqual(cal.count, 3)
+        # 只喂爪子脚 -> 建议区域包住它的中心
+        cal2 = m.IgnoreCalib(FW, FH, 0)
+        for dy in (-5, 0, 5):
+            cal2.feed([det(box_at(640 + dy, 690, 50))], rects, [], 0)
+        sug = cal2.suggestion()
+        self.assertTrue(sug[0] <= u <= sug[2] and sug[1] <= 0.5 <= sug[3], sug)
+        self.assertIsNone(m.IgnoreCalib(FW, FH, 0).suggestion())
+
+
 # ====================================================================== 标定工具
 class TestDepthFit(unittest.TestCase):
     def setUp(self):

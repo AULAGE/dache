@@ -128,6 +128,20 @@ GC_MIN_FREE_KB = 0          # >0 时改为"空闲内存低于该值才 gc"（替
 REFINE_GRID_CEIL = False    # 颜色精修降采样步长向上取整，保证网格不超过 REFINE_GRID（原来向下取整，小目标网格可达 95x95）
 PROFILE_DETAIL = False      # Profiler 额外统计颜色精修内部各步（center_color / mask / fit_obb / subpixel）耗时
 
+# ============================ 忽略区域（爪子脚，云端任务 10） ============================
+# 相机和爪子装在同一节上，爪子在画面里的位置永远不变。中心落在这些区域里的检测框在进跟踪器之前直接丢掉；
+# 跟踪器已经锁定的目标一旦进入区域也立即放弃 —— 跟踪器就不会再锁住爪子脚。
+# 坐标：0~1 归一化，基于 IDE 里看到的（旋转后的）画面：左上角 (0, 0)，右下角 (1, 1)，
+#       每项 (左, 上, 右, 下)。OSD 上画的红色虚线框就是这里的区域，和 IDE 画面对照着调。
+# 说明见 docs/cloud_tasks/results/10_报告.md
+IGNORE_REGIONS_ENABLE = True
+IGNORE_REGIONS = [
+    (0.00, 0.40, 0.12, 0.60),   # 爪子脚：画面左侧中间（2026-11-03 在 IDE 里目测约 1/60 面积，区域取得略大，约 1/40）
+]
+IGNORE_DRAW = True              # 在 OSD 上用红色虚线框画出忽略区域
+IGNORE_CALIB_MODE = False       # True：终端持续打印每个检测框的归一化中心和大小（不放物块时看爪子脚被识别成什么样）
+IGNORE_CALIB_EVERY_MS = 200     # 标定打印的最小间隔（毫秒）
+
 # ============================ 显示 ============================
 display_mode = "hdmi"
 
@@ -282,6 +296,143 @@ def rotate_point(x, y, frame_w, frame_h):
     elif ROTATE_DEG == 270:
         return y, frame_w - x
     return x, y
+
+def unrotate_point(px, py, frame_w, frame_h):
+    """rotate_point 的逆变换：显示（旋转后）画面坐标 -> 原始 AI 画面坐标（frame_w x frame_h）"""
+    if ROTATE_DEG == 90:      # (x, y) -> (H - y, x)
+        return py, frame_h - px
+    elif ROTATE_DEG == 270:   # (x, y) -> (y, W - x)
+        return frame_w - py, px
+    return px, py
+
+def disp_size_of(frame_w, frame_h):
+    """显示（旋转后）画面的宽高"""
+    return (frame_h, frame_w) if ROTATED else (frame_w, frame_h)
+
+def raw_to_disp_norm(x, y, frame_w, frame_h):
+    """原始 AI 画面像素 -> 显示画面的 0~1 归一化坐标（IDE 里看到的方向）"""
+    dw, dh = disp_size_of(frame_w, frame_h)
+    px, py = rotate_point(x, y, frame_w, frame_h)
+    return px / dw, py / dh
+
+def ignore_region_to_raw(region, frame_w, frame_h):
+    """忽略区域（显示画面归一化 (左, 上, 右, 下)）-> 原始 AI 画面像素矩形 (x1, y1, x2, y2)"""
+    dw, dh = disp_size_of(frame_w, frame_h)
+    u1, v1, u2, v2 = region
+    a = unrotate_point(min(u1, u2) * dw, min(v1, v2) * dh, frame_w, frame_h)
+    b = unrotate_point(max(u1, u2) * dw, max(v1, v2) * dh, frame_w, frame_h)
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1]))
+
+def ignore_rects_raw(frame_w, frame_h):
+    """当前配置下要忽略的原始像素矩形列表（关掉开关时为空）"""
+    if not IGNORE_REGIONS_ENABLE:
+        return []
+    return [ignore_region_to_raw(r, frame_w, frame_h) for r in IGNORE_REGIONS]
+
+def in_ignore(cx, cy, rects):
+    """原始像素点是否落在任一忽略矩形里（含边界）"""
+    for r in rects:
+        if r[0] <= cx <= r[2] and r[1] <= cy <= r[3]:
+            return True
+    return False
+
+def filter_ignored(det_boxes, rects):
+    """丢掉中心落在忽略区域里的检测框。det = [cls, score, x1, y1, x2, y2]（原始像素）。返回 (保留的, 丢掉几个)"""
+    if not rects or not det_boxes:
+        return det_boxes, 0
+    keep = [b for b in det_boxes if not in_ignore((b[2] + b[4]) / 2.0, (b[3] + b[5]) / 2.0, rects)]
+    return keep, len(det_boxes) - len(keep)
+
+def tracker_in_ignore(tracker, rects):
+    """跟踪器当前锁定的目标是否进入了忽略区域（看平滑后的框中心；丢帧保持中看预测框中心）"""
+    if not rects or tracker.smooth is None:
+        return False
+    s = tracker.predicted() if tracker.miss > 0 else tracker.smooth
+    return in_ignore((s[0] + s[2]) / 2.0, (s[1] + s[3]) / 2.0, rects)
+
+def dashed_rect_segments(x1, y1, x2, y2, dash=12, gap=8):
+    """虚线矩形的线段列表 [(xa, ya, xb, yb), ...]（OSD 画忽略区域用，启动时算一次）"""
+    segs = []
+    def side(ax, ay, bx, by):
+        length = math.sqrt((bx - ax) ** 2 + (by - ay) ** 2)
+        if length <= 0:
+            return
+        ux, uy = (bx - ax) / length, (by - ay) / length
+        t = 0.0
+        while t < length:
+            e = min(length, t + dash)
+            segs.append((int(ax + ux * t), int(ay + uy * t), int(ax + ux * e), int(ay + uy * e)))
+            t = e + gap
+    side(x1, y1, x2, y1)
+    side(x2, y1, x2, y2)
+    side(x2, y2, x1, y2)
+    side(x1, y2, x1, y1)
+    return segs
+
+def ignore_osd_segments(osd_w, osd_h):
+    """所有忽略区域在 OSD（与显示画面重合，osd_w x osd_h）上的虚线段，和每个区域标签的位置"""
+    segs, labels = [], []
+    for (u1, v1, u2, v2) in IGNORE_REGIONS:
+        x1 = int(clamp(min(u1, u2) * osd_w, 0, osd_w - 1))
+        x2 = int(clamp(max(u1, u2) * osd_w, 0, osd_w - 1))
+        y1 = int(clamp(min(v1, v2) * osd_h, 0, osd_h - 1))
+        y2 = int(clamp(max(v1, v2) * osd_h, 0, osd_h - 1))
+        segs.extend(dashed_rect_segments(x1, y1, x2, y2))
+        labels.append((x1 + 2, y1 + 2))
+    return segs, labels
+
+class IgnoreCalib:
+    """IGNORE_CALIB_MODE：打印每个检测框在显示画面里的归一化中心 / 大小，并累计所有中心的范围，给出建议区域"""
+    def __init__(self, frame_w, frame_h, every_ms):
+        self.fw, self.fh = frame_w, frame_h
+        self.every_ms = every_ms
+        self.last = None
+        self.rng = None          # [umin, vmin, umax, vmax]
+        self.count = 0
+
+    def describe(self, b, rects):
+        """一个检测框 -> (u, v, w, h, 是否在忽略区域)，都是显示画面归一化值"""
+        dw, dh = disp_size_of(self.fw, self.fh)
+        u, v = raw_to_disp_norm((b[2] + b[4]) / 2.0, (b[3] + b[5]) / 2.0, self.fw, self.fh)
+        bx = rotate_box(b[2], b[3], b[4], b[5], self.fw, self.fh)
+        w, h = (bx[2] - bx[0]) / dw, (bx[3] - bx[1]) / dh
+        ign = in_ignore((b[2] + b[4]) / 2.0, (b[3] + b[5]) / 2.0, rects)
+        return u, v, w, h, ign
+
+    def feed(self, det_boxes, rects, labels, now_ms):
+        """每帧调用（det_boxes 是过滤前的全部检测框）。到了打印间隔返回要打印的文字，否则返回 None"""
+        items = [self.describe(b, rects) for b in det_boxes]
+        for (u, v, w, h, ign) in items:
+            self.count += 1
+            if self.rng is None:
+                self.rng = [u, v, u, v]
+            else:
+                r = self.rng
+                r[0], r[1] = min(r[0], u), min(r[1], v)
+                r[2], r[3] = max(r[2], u), max(r[3], v)
+        if self.last is not None and now_ms is not None and self.every_ms > 0 \
+                and time.ticks_diff(now_ms, self.last) < self.every_ms:
+            return None
+        self.last = now_ms
+        if not items:
+            return "[IGN-CAL] 没有检测框"
+        parts = []
+        for b, (u, v, w, h, ign) in zip(det_boxes, items):
+            cls = int(b[0])
+            name = labels[cls] if labels and 0 <= cls < len(labels) else str(cls)
+            area = w * h
+            parts.append("{} {:.2f} 中心({:.3f},{:.3f}) 宽高({:.3f},{:.3f}) 面积1/{:.0f}{}{}".format(
+                name, b[1], u, v, w, h, 1.0 / area if area > 0 else 0,
+                "" if box_shape_ok(b) else " 形状不符", " [忽略]" if ign else ""))
+        return "[IGN-CAL] " + " | ".join(parts)
+
+    def suggestion(self, pad=0.02):
+        """到目前为止所有检测框中心的范围外扩 pad，作为 IGNORE_REGIONS 的建议值（没放物块时才有意义）"""
+        if self.rng is None:
+            return None
+        r = self.rng
+        return (round(max(0.0, r[0] - pad), 3), round(max(0.0, r[1] - pad), 3),
+                round(min(1.0, r[2] + pad), 3), round(min(1.0, r[3] + pad), 3))
 
 def obb_corners(obb):
     """obb = [cx, cy, w, h, angle_deg] -> 4 个角点（顺时针）"""
@@ -1253,6 +1404,15 @@ def detection():
     prof = Profiler(DEBUG_TIMING, PROFILE_EVERY)
     frame_dt = REF_FRAME_MS
     frame_no = 0
+    # 忽略区域（任务 10）：启动时换算成原始像素矩形和 OSD 虚线段，主循环里只做比较
+    ign_rects = ignore_rects_raw(FW, FH)
+    ign_segs, ign_labels = ignore_osd_segments(OSD_W, OSD_H) if (IGNORE_REGIONS_ENABLE and IGNORE_DRAW) else ([], [])
+    ign_calib = IgnoreCalib(FW, FH, IGNORE_CALIB_EVERY_MS) if IGNORE_CALIB_MODE else None
+    ign_tip_ms = time.ticks_ms()
+    if ign_rects:
+        print("ignore regions (display 0~1):", IGNORE_REGIONS)
+        print("ignore regions (raw {}x{} px):".format(FW, FH),
+              [tuple(int(round(v)) for v in r) for r in ign_rects])
     print("Init done. rotate={} video={}x{} at ({},{})".format(ROTATE_DEG, VID_W, VID_H, VID_X, VID_Y))
 
     while True:
@@ -1290,6 +1450,18 @@ def detection():
                 del results
                 prof.mark("post")
 
+                # ---------- 忽略区域（爪子脚）：中心落在区域里的检测框不进跟踪器 ----------
+                if ign_calib is not None:
+                    txt = ign_calib.feed(det_boxes or [], ign_rects, labels, time.ticks_ms())
+                    if txt:
+                        print(txt)
+                    if time.ticks_diff(time.ticks_ms(), ign_tip_ms) > 5000:
+                        ign_tip_ms = time.ticks_ms()
+                        print("[IGN-CAL] 累计 {} 个检测框，中心范围外扩 0.02 = 建议区域 {}".format(
+                            ign_calib.count, ign_calib.suggestion()))
+                if ign_rects:
+                    det_boxes, _ = filter_ignored(det_boxes or [], ign_rects)
+
                 # ---------- 选择目标 ----------
                 cc_cache = {} if CACHE_CENTER_COLOR else None
                 if color_ok:
@@ -1326,11 +1498,18 @@ def detection():
                         print("Target lost.")
                         if SEND_LOST_FRAME:
                             send_position_via_uart(0, 0, 0)
+                if ign_rects and tracker_in_ignore(tracker, ign_rects):
+                    print("Target entered ignore region, dropped.")
+                    tracker.reset()
                 prof.mark("refine")
 
                 draw_osd = OSD_EVERY <= 1 or frame_no % OSD_EVERY == 0
                 osd = osd_img if draw_osd else _NULL_OSD
                 osd.clear()
+                for (xa, ya, xb, yb) in ign_segs:
+                    osd.draw_line(xa, ya, xb, yb, color=(255, 60, 60), thickness=2)
+                for (lx, ly) in ign_labels:
+                    osd.draw_string_advanced(lx, ly, 20, "IGN", color=(255, 60, 60))
 
                 if tracker.confirmed():
                     holding = tracker.miss > 0
