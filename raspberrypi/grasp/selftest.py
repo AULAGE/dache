@@ -5,6 +5,7 @@
 
   python3 selftest.py          全部测试（约 1 分钟）
   python3 selftest.py quick    跳过耗时的仿真回归
+  python3 selftest.py research 全部测试 + 研究原型（research/，任务 11）的单元测试
 """
 import importlib
 import json
@@ -1240,8 +1241,21 @@ def test_sim():
         main.cfg = cfg
 
 
+# ------------------------------------------------------------ 研究原型（可选，任务 11）
+def test_research():
+    print("研究原型 research/（任务 11，仿真）")
+    import io
+    import unittest
+    from research import test_research as tr
+    buf = io.StringIO()
+    res = unittest.TextTestRunner(stream=buf, verbosity=1).run(unittest.defaultTestLoader.loadTestsFromModule(tr))
+    bad = [str(t) for t, _ in res.failures + res.errors]
+    check(f"research 单元测试 {res.testsRun} 项全部通过", res.wasSuccessful(), "；".join(bad))
+
+
 if __name__ == "__main__":
     quick = len(sys.argv) > 1 and sys.argv[1] == "quick"
+    research = "research" in sys.argv[1:]
     real_serial = devices.serial
     for t in (test_arm, test_k230, test_lift, test_chassis, test_chassis_fw, test_calib_override,
               test_step_and_guard, test_geometry, test_ghost, test_ghost_fingerprint, test_sim_factors,
@@ -1254,5 +1268,10 @@ if __name__ == "__main__":
             devices.serial = real_serial
     if not quick:
         test_sim()
+    if research:
+        try:
+            test_research()
+        except Exception as e:
+            check("test_research 崩溃", False, repr(e))
     print(f"\n通过 {len(PASS)} 项，失败 {len(FAIL)} 项" + ("" if not FAIL else "：" + "；".join(FAIL)))
     sys.exit(1 if FAIL else 0)
