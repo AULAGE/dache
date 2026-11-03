@@ -267,6 +267,17 @@ def run_check():
 
 
 # ============================================================ 真机运行
+def attach_task(task, devs, clock, step=False, guard=None):
+    """把（重新）打开的设备装到抓取任务上；task 为 None 时新建（bench.py 也用）"""
+    cam, lift, arm, chassis = devs
+    if step:
+        lift, arm, chassis = (StepProxy(lift, "升降轴"), StepProxy(arm, "机械臂"), StepProxy(chassis, "底盘"))
+    if task is None:
+        return GraspTask(cfg, clock, cam, lift, arm, chassis, log_dir=LOG_DIR, guard=guard)
+    task.cam, task.lift, task.arm, task.chassis = cam, lift, arm, chassis
+    return task
+
+
 def run_real(once, step, force):
     clock = RealClock()
     guard = ManualGuard(cfg.MANUAL_PROCESS)
@@ -291,14 +302,7 @@ def run_real(once, step, force):
                     if problems and not force:
                         print(f"有 {len(problems)} 项检查没通过，不启动（确认安全的话可以加 --force 跳过）")
                         return
-                cam, lift, arm, chassis = devs
-                if step:
-                    lift, arm, chassis = (StepProxy(lift, "升降轴"), StepProxy(arm, "机械臂"),
-                                          StepProxy(chassis, "底盘"))
-                if task is None:
-                    task = GraspTask(cfg, clock, cam, lift, arm, chassis, log_dir=LOG_DIR, guard=guard)
-                else:
-                    task.cam, task.lift, task.arm, task.chassis = cam, lift, arm, chassis
+                task = attach_task(task, devs, clock, step, guard)
             try:
                 r = task.run_once()
             except ManualOverride as e:
