@@ -146,6 +146,7 @@ SEARCH_LIFT_CM = [25, 10, 40]    # 依次在这些高度搜索（中间高度先
 # 没有底盘时物块很近：上下视野窄，且相机在转轴外，转底座时视差大，所以高度和角度都扫密一些
 SEARCH_LIFT_CM_NEAR = [25, 15, 35, 5, 45]
 SEARCH_BASE_DEG_NEAR = [0, -30, 30, -60, 60]
+SEARCH_LOOK_FIRST = True         # 搜索前先原地看一眼（不动升降轴/底座），看到就直接对准
 SEARCH_BACKOFF_MM = 250          # 都没找到：底盘后退这么多再搜一遍（物块太近时上下视野太窄会漏掉）
 # 误识别过滤（任务 02 仿真发现）：搜索时第一次看到目标，原地再测 1~2 次，位置一致才采信。
 # False = 原行为（看到就采信）。打开后每次找到目标多花约 1 秒
@@ -219,7 +220,7 @@ CALIB_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "calib.
 CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "GOAL", "TOL", "R_CAM_MM", "BASE_DIR", "BASE_CENTER", "BASE_US_PER_DEG", "CLAW_OPEN", "CLAW_CLOSE",
     "REACH_NEAR_D", "REACH_FAR_D", "POSES_CALIBRATED", "ACK_MIN_RADIUS_MM", "K230_ROTATE", "LIFT_MAX_CM",
-    "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
+    "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "SEARCH_LOOK_FIRST", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
     "ARM_SLOW_MS", "STEP_ALPHA",
     "CHASSIS_STOP_MODEL", "CHASSIS_CMD_LATENCY_S", "CHASSIS_PI_TAU_S", "CHASSIS_REF_VOLTAGE_V",
     "CHASSIS_CMD_TTL_S", "CHASSIS_YAW_TRIM_DEG_PER_M",

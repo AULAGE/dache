@@ -125,6 +125,14 @@ class GraspTask:
         每个高度：先只转底座扫前方（最快）→ 底盘掉头扫后方（仅差速底盘）；没找到再换高度
         """
         c = self.cfg
+        if c.SEARCH_LOOK_FIRST:
+            # 先原地看一眼（不动升降轴、不转底座）：物块往往就在标定时的位置附近
+            m = self.measure()
+            if m:                        # 原地这一眼一律复核：避免把一闪而过的误识别当真
+                m = self.confirm_target(m)
+            if m:
+                self.say("搜索：原地就看到了目标")
+                return m
         turns = [0] + (list(c.SEARCH_CHASSIS_TURNS) if self.can_turn else [])
         bases = list(c.SEARCH_BASE_DEG if c.USE_CHASSIS else c.SEARCH_BASE_DEG_NEAR)
         heights = c.SEARCH_LIFT_CM if c.USE_CHASSIS else c.SEARCH_LIFT_CM_NEAR
