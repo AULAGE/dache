@@ -1,5 +1,12 @@
 #include "include.h"
 
+/* 1 = UART1 accepts single-char jog commands 1..6 (old STM32 tracker interface).
+   0 = off (default): the Raspberry Pi only sends binary 0x55 0x55 frames, and stray
+   bytes during USB reconnects must not move the servos. */
+#ifndef UART1_CHAR_JOG
+#define UART1_CHAR_JOG 0
+#endif
+
 /*
  * Interior angles (deg): T1=12-3-4, T2=3-4-5, T3=4-5 ref; T1+T2+T3=360.
  * T1=0.09*(p5-p4)+90, T2=0.09*p4+45, T3=225-0.09*p5  (p3 not in T1,T3 fit)
@@ -320,7 +327,7 @@ void USART1_IRQHandler(void)
     {
 
         rxBuf = USART_ReceiveData(USART1);//(USART1->DR);	//??????????????
-				if(fFrameStart) { } /* fixed: frame bytes are not jog commands */
+				if(fFrameStart || !UART1_CHAR_JOG) { } /* jog only outside frames, and only if enabled */
 				else 				if(rxBuf == '1')  /* ?????5????+??4????-??????3?????? */
 				{
 					ArmHoriz_StepForward();

@@ -62,7 +62,8 @@ void USART3_IRQHandler(void)                	//串口3中断服务程序
 	if(USART_GetITStatus(USART3, USART_IT_RXNE) != RESET)  //接收中断(接收到的数据必须是0x0d 0x0a结尾)
 	{
 		rxBuf =USART_ReceiveData(USART3);//(USART1->DR);	//读取接收到的数据
-		if(rxBuf == '1')  //向前：舵机5加，舵机4加
+		if(fFrameStart) { } /* fixed: frame bytes are not jog commands */
+		else 		if(rxBuf == '1')  //向前：舵机5加，舵机4加
 		{
 			if(ServoPwmDutySet[5] < 2500) ServoPwmDutySet[5] += 20;
 			if(ServoPwmDutySet[4] > 500) ServoPwmDutySet[4] -= 20;
