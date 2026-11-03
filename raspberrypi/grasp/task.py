@@ -340,6 +340,17 @@ class GraspTask:
         trim = c.GRASP_BASE_TRIM_DEG
         bp = self.base_pulse(max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, self.base_deg + trim)))
 
+        # 给 bench.py 记录用（不影响流程）：最后一次伸爪时对准测到的物块位置和当时的姿态
+        lift_pos = getattr(self.lift, "pos", None)
+        if lift_pos is None and hasattr(self.lift, "position"):     # 仿真升降轴没有 pos（真机 preflight 后总有）
+            try:
+                lift_pos = self.lift.position()
+            except DeviceError:
+                pass
+        self.last_grasp = {"x_deg": round(m.x_deg, 2), "y": round(m.y, 1), "d": round(m.d, 1),
+                           "base_deg": round(self.base_deg, 2),
+                           "lift_cm": None if lift_pos is None else round(lift_pos, 2),
+                           "t": round(t, 3), "trim_deg": trim}
         self.say(f"抓取：深度 {m.d:.0f}mm，插值 t={max(0.0, min(1.0, t)):.2f}，底座 {self.base_deg:+.1f}°"
                  + (f"（微调 {trim:+.1f}°）" if trim else ""))
         self.arm.move({c.CLAW_ID: c.CLAW_OPEN}, 300)
@@ -464,6 +475,7 @@ class GraspTask:
     def run_once(self):
         c = self.cfg
         self.episode += 1
+        self.last_grasp = None          # 这次有没有伸过爪、伸爪时的位置（bench.py 用）
         t0 = self.clock.now()
         steps = 0
         attempts = 0

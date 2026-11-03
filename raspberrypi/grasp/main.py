@@ -267,47 +267,78 @@ def run_check():
 
 
 # ============================================================ 真机运行
+class RealSession:
+    """
+    真机会话：打开设备 → 第一次做启动前检查 → 建 GraspTask；run_once() 跑一次抓取。
+    main.py 的真机循环和 bench.py（试验记录工具）都用它，抓取逻辑只有 task.py 一份。
+    """
+
+    def __init__(self, step=False, force=False, clock=None, guard=None):
+        self.clock = clock or RealClock()
+        self.guard = guard if guard is not None else ManualGuard(cfg.MANUAL_PROCESS)
+        self.step, self.force = step, force
+        self.devs = None
+        self.task = None
+        self.checked = False
+
+    def release(self):
+        """关掉串口（让给手柄程序，或者设备出错后下次重开）；升降轴急停、底盘停车"""
+        if self.devs:
+            close_devices(self.devs)
+            self.devs = None
+
+    close = release
+
+    def open(self):
+        """打开设备（已经打开就什么都不做）。启动前检查没通过、又没有 --force 时返回 False"""
+        if self.devs is not None:
+            return True
+        self.devs = open_devices(self.clock)
+        if not self.checked:
+            problems = preflight(*self.devs)
+            self.checked = True
+            if problems and not self.force:
+                print(f"有 {len(problems)} 项检查没通过，不启动（确认安全的话可以加 --force 跳过）")
+                return False
+        cam, lift, arm, chassis = self.devs
+        if self.step:
+            lift, arm, chassis = (StepProxy(lift, "升降轴"), StepProxy(arm, "机械臂"),
+                                  StepProxy(chassis, "底盘"))
+        if self.task is None:
+            self.task = GraspTask(cfg, self.clock, cam, lift, arm, chassis, log_dir=LOG_DIR, guard=self.guard)
+        else:
+            self.task.cam, self.task.lift, self.task.arm, self.task.chassis = cam, lift, arm, chassis
+        return True
+
+    def run_once(self):
+        """跑一次抓取，返回 episodes.csv 那一行。设备出错时关掉设备再抛出 DeviceError（下次 open 会重开）"""
+        try:
+            return self.task.run_once()
+        except DeviceError as e:
+            print("设备错误：", e)
+            self.release()
+            raise
+
+
 def run_real(once, step, force):
-    clock = RealClock()
-    guard = ManualGuard(cfg.MANUAL_PROCESS)
+    s = RealSession(step, force)
     time.sleep(1.2)
-    task = None
-    devs = None
-    checked = False
     try:
         while True:
-            if guard.active:
-                if devs:
-                    close_devices(devs)          # 让出串口给手柄程序
-                    devs = None
+            if s.guard.active:
+                if s.devs:
+                    s.release()          # 让出串口给手柄程序
                     print("手柄接管中，串口已释放，等待手柄断开……")
                 time.sleep(1.0)
                 continue
-            if devs is None:
-                devs = open_devices(clock)
-                if not checked:
-                    problems = preflight(*devs)
-                    checked = True
-                    if problems and not force:
-                        print(f"有 {len(problems)} 项检查没通过，不启动（确认安全的话可以加 --force 跳过）")
-                        return
-                cam, lift, arm, chassis = devs
-                if step:
-                    lift, arm, chassis = (StepProxy(lift, "升降轴"), StepProxy(arm, "机械臂"),
-                                          StepProxy(chassis, "底盘"))
-                if task is None:
-                    task = GraspTask(cfg, clock, cam, lift, arm, chassis, log_dir=LOG_DIR, guard=guard)
-                else:
-                    task.cam, task.lift, task.arm, task.chassis = cam, lift, arm, chassis
+            if not s.open():
+                return
             try:
-                r = task.run_once()
+                r = s.run_once()
             except ManualOverride as e:
                 print(e)
                 continue
-            except DeviceError as e:
-                print("设备错误：", e)
-                close_devices(devs)
-                devs = None
+            except DeviceError:
                 if once:
                     raise
                 time.sleep(3)
@@ -319,8 +350,7 @@ def run_real(once, step, force):
     except KeyboardInterrupt:
         print("\n手动停止：升降轴急停、底盘停车")
     finally:
-        if devs:
-            close_devices(devs)
+        s.close()
 
 
 if __name__ == "__main__":

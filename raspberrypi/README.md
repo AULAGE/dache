@@ -75,9 +75,10 @@ K230 ──串口──►                ┌──► 升降轴 STM32（伺服�
 | `grasp/calib.json` | **标定结果**（`calib.py` 自动写，覆盖 config.py 里的默认值；删掉就恢复默认） |
 | `grasp/calib.py` | 标定工具：watch / goal / jog / auto / teach …… |
 | `grasp/main.py` | 入口：`--check` 自检、`--sim` 仿真、真机运行（`--step` 单步、`--no-chassis`） |
-| `grasp/selftest.py` | 离线自测：假下位机测所有驱动（底盘按固件源码复现）+ 几何前馈 + 仿真回归（48 项）。改完代码先跑它 |
+| `grasp/selftest.py` | 离线自测：假下位机测所有驱动（底盘按固件源码复现）+ 几何前馈 + bench.py + 仿真回归（89 项）。改完代码先跑它 |
 | `grasp/chassis_test.py` | 底盘停车精度真机测试：走 ±100mm 各 3 次打印误差、航向漂移（`--model`、`--ruler`、`--timeout-check`），见 `docs/cloud_tasks/results/03_报告.md` |
 | `grasp/report.py` | 看日志：成功率、步数趋势、某次抓取的逐步误差/动作，并给出诊断提示 |
+| `grasp/bench.py` | 真机试验记录工具：按 9 个位置引导放物块 → 自动抓 → 人工记录"真的抓到没有"和偏差 → 按位置统计并给出调参建议（`logs/bench.csv`） |
 | `grasp/task.py` | 任务流程：搜索 → 对准 → 抓取 → 确认 → 放置 |
 | `grasp/servo.py` | 自适应视觉伺服 |
 | `grasp/devices.py` | 驱动：K230、升降轴、机械臂、底盘、手柄接管检测 |
@@ -129,6 +130,20 @@ python3 main.py --once --step --no-chassis   # 物块放在臂展内；每个动
 ```
 **7. 放开单步**：`python3 main.py --once --no-chassis`
 **8. 加上底盘**：物块放远一点（30~60cm），`python3 main.py --once --step` → 没问题再去掉 `--step`
+
+**9. 测试矩阵：记录真实结果**（程序说"抓到"不一定真抓到，一定要人工记）
+```bash
+python3 bench.py                     # 9 个位置 × 2 次：提示放到哪 → 回车自动抓 → 问"真的抓到了吗"、偏哪边、偏几毫米
+python3 bench.py --positions 2,5,8 --repeat 3   # 只测这几个位置，每个 3 次
+python3 bench.py --resume            # Ctrl+C 退出后（升降轴会急停），接着没测的位置继续
+python3 bench.py report              # 最近一轮：按位置的真实成功率、误报、偏差方向 + 建议（例如 calib.py trim 4 180）
+python3 bench.py report all          # 所有轮次一起统计
+```
+- 位置：近/中/远 = 离底座转轴约 15/18/21cm；左/右 = 往左/右约 10°（底座右转为正，和 config 一致）
+- 偏差方向按"爪子落点相对物块"回答：前 = 伸过头，后 = 没伸到；不知道就直接回车
+- 默认无底盘（等价 `main.py --once --no-chassis`），`--chassis` 用底盘，`--step` 单步；`--sim` 不接硬件试用
+- 每次抓取的完整输出照样在 `logs/run_*.log`（bench.csv 的 log 列就是对应的文件名）
+- 调了 `calib.py trim` 之后开新的一轮（不加 `--resume`），`report` 默认只看最近一轮，不会和旧微调混在一起
 
 出问题时：`python3 report.py`（最近一次的每一步 + 自动诊断）、`logs/run_*.log`（完整输出）。
 

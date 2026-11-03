@@ -732,6 +732,177 @@ def test_ghost():
         cfg.USE_CHASSIS = saved
 
 
+# ------------------------------------------------------------ 试验记录工具 bench.py（任务 08）
+def test_bench():
+    print("试验记录工具 bench.py（仿真设备 + 假输入）")
+    import builtins
+    import contextlib
+    import csv as csv_mod
+    import io
+    import config as cfg
+    import bench
+    import main
+    from sim import SIM_POSES, make_sim
+    importlib.reload(cfg)
+    bench.cfg = main.cfg = cfg
+    tmp = tempfile.mkdtemp(prefix="bench_test_")
+    path = os.path.join(tmp, "bench.csv")
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    try:
+        # 1 位置说明：左右方向和 config 一致（底座右转为正、左为负）
+        check("位置 ⑤ 说明具体（距离 + 正前方）", "18cm" in bench.pos_text(5) and "正前方" in bench.pos_text(5),
+              bench.pos_text(5))
+        check("位置 ① 在左（-10°）、⑨ 在右（+10°）",
+              bench.pos_spec(1)[3] == -10 and bench.pos_spec(9)[3] == 10 and "往左" in bench.pos_text(1))
+        check("--positions 2,5,8 / --repeat 3 的测试顺序",
+              bench.make_plan(bench.parse_positions("2,5,8"), 3)[:4] == [(2, 1), (5, 1), (8, 1), (2, 2)]
+              and len(bench.make_plan([2, 5, 8], 3)) == 9)
+
+        # 2 仿真跑 5 个位置：假输入按仿真真实结果回答；第 4 次放物块时按 Ctrl+C
+        runner = bench.SimRunner(seed=3)
+        prompts = []
+
+        def ask(p=""):
+            prompts.append(p)
+            if "放好后回车" in p and sum("放好后回车" in x for x in prompts) == 4:
+                raise KeyboardInterrupt
+            if "真的抓到" in p:
+                return "y" if runner.world.picked else "n"
+            if "偏哪边" in p:
+                return "r"
+            if "几毫米" in p:
+                return "4"
+            return ""
+
+        with quiet:
+            n = bench.run_bench(runner, bench.make_plan([1, 5, 9, 3, 7], 1), path, "R1", ask=ask)
+        rows = bench.read_rows(path)
+        check("Ctrl+C：已完成的 3 次都记下、设备已关闭（升降轴急停）", n == 3 and len(rows) == 3 and runner.closed)
+        with open(path, encoding="utf-8") as f:
+            header = next(csv_mod.reader(f))
+        need = ["time", "pos", "prog_result", "real", "dev_dir", "dev_mm", "x_deg", "y", "d", "base_deg",
+                "lift_cm", "t", "trim_deg", "steps", "time_s"]
+        check("bench.csv 有要求的所有列", all(k in header for k in need))
+        r1, r5, r9 = rows
+        check("记录了对准时的物块位置、底座角度、升降高度、插值 t",
+              all(r["d"] and r["base_deg"] and r["lift_cm"] and r["t"] for r in rows), str(r1))
+        check("左边位置底座为负、右边为正（和 config 约定一致）",
+              float(r1["base_deg"]) < -5 and float(r9["base_deg"]) > 5 and abs(float(r5["base_deg"])) < 3,
+              f"{r1['base_deg']} / {r5['base_deg']} / {r9['base_deg']}")
+        check("真实结果按人工回答记录", all(r["real"] in ("y", "n") for r in rows))
+
+        # 3 --resume：从没测的位置继续（不重测已完成的）
+        old = builtins.input
+        seen = []
+
+        def ask2(p=""):
+            if "放好后回车" in p:
+                seen.append(p)
+            return "y" if "真的抓到" in p else ""
+        builtins.input = ask2
+        try:
+            with quiet:
+                bench.main(["--positions", "1,5,9,3,7", "--repeat", "1", "--resume", "--sim", "3", "--csv", path])
+        finally:
+            builtins.input = old
+        rows = bench.read_rows(path)
+        check("--resume 只测剩下的 ③ ⑦，同一轮",
+              [r["pos"] for r in rows] == ["1", "5", "9", "3", "7"] and len({r["round"] for r in rows}) == 1
+              and len(seen) == 2, str([r["pos"] for r in rows]))
+
+        # 4 x = 作废重测、程序没伸爪时自动记为没抓到
+        class FakeRunner:
+            sim, chassis, closed = False, False, False
+            def __init__(self, seq): self.seq = seq
+            def start(self): return True
+            def run(self, pos):
+                r = self.seq.pop(0)
+                if isinstance(r, BaseException):
+                    raise r
+                return r
+            def close(self): self.closed = True
+        ok_row = ({"result": "success", "steps": 3, "attempts": 1, "time_s": 20.0},
+                  {"x_deg": -1.0, "y": 60.0, "d": 180.0, "base_deg": 2.0, "lift_cm": 10.0, "t": 0.4, "trim_deg": -1.3})
+        nf_row = ({"result": "not_found", "steps": 0, "attempts": 0, "time_s": 30.0}, None)
+        p2 = os.path.join(tmp, "b2.csv")
+        answers = iter(["", "x", "", "y", "", "", ""])
+        fr = FakeRunner([ok_row, ok_row, nf_row])
+        with quiet:
+            bench.run_bench(fr, [(5, 1), (2, 1)], p2, "R", ask=lambda p="": next(answers))
+        rows = bench.read_rows(p2)
+        check("x 作废后重测；没伸爪自动记为没抓到",
+              len(rows) == 2 and rows[0]["real"] == "y" and rows[0]["trim_deg"] == "-1.3"
+              and rows[1]["real"] == "n" and rows[1]["dev_dir"] == "未伸爪", str([(r["real"], r["dev_dir"]) for r in rows]))
+        # 抓取进行中 Ctrl+C：设备关闭，不记这一次
+        fr = FakeRunner([ok_row, KeyboardInterrupt()])
+        answers = iter(["", "y", "", ""])
+        p3 = os.path.join(tmp, "b3.csv")
+        with quiet:
+            n = bench.run_bench(fr, [(1, 1), (2, 1)], p3, "R", ask=lambda p="": next(answers))
+        check("抓取过程中 Ctrl+C：急停关设备，只留完成的那次", n == 1 and fr.closed and len(bench.read_rows(p3)) == 1)
+
+        # 5 统计和建议（人造数据）
+        def mk(pos, prog, real, dev="", mm="", d=180, trim="-1.3"):
+            return {"round": "X", "pos": str(pos), "prog_result": prog, "real": real, "dev_dir": dev,
+                    "dev_mm": str(mm), "d": str(d), "base_deg": "0", "trim_deg": trim, "time_s": "20",
+                    "note": "", "log": "run_x.log"}
+        rows = [mk(p, "success", "y") for p in range(1, 10)]
+        rows += [mk(p, "grasp_failed", "n", "右", 4) for p in (1, 2, 4, 5, 8, 9)] + [mk(3, "success", "n", "左", 2)]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bench.report(rows)
+        out = buf.getvalue()
+        check("多数位置偏右 4mm → 建议 calib.py trim 4", "calib.py trim 4 180" in out, out.splitlines()[-2:])
+        check("误报计数和混淆表", "误报 1 次" in out and "← 误报" in out and "③ 1/2 误报1" in out)
+        rows = [mk(p, "success", "y") for p in range(1, 10)]
+        rows += [mk(p, "grasp_failed", "n", "右", 5) for p in (3, 6, 9)] + [mk(5, "grasp_failed", "n", "左", 1)]
+        tips = bench.suggest(rows)
+        check("只有右侧位置偏右 → 提示底座回差（任务 09），不建议 trim",
+              any("任务 09" in t and "右侧" in t for t in tips) and not any("trim" in t and "运行" in t for t in tips),
+              str(tips))
+        rows = [mk(p, "success", "y") for p in (1, 2, 3, 7, 8, 9)] * 2
+        rows += [mk(p, "grasp_failed", "n", "低", 6) for p in (4, 5, 6)] * 2
+        tips = bench.suggest(rows)
+        check("中间深度没抓到、两端抓到 → 提示 reach_mid", sum("reach_mid" in t for t in tips) >= 1, str(tips))
+
+        # 6 main.py 的 RealSession（bench 和 main 共用）：用仿真设备代替真机
+        cfg.POSES = SIM_POSES
+        cfg.USE_CHASSIS = False
+        _, clock, cam, lift, arm, ch = make_sim(cfg, 5, 1.0, cfg.R_CAM_MM)
+        saved = (main.open_devices, main.preflight, main.LOG_DIR)
+        opened = []
+        problems = [["升降轴"]]
+        main.open_devices = lambda c: opened.append(1) or (cam, lift, arm, ch)
+        main.preflight = lambda *d: problems[0]
+        main.LOG_DIR = tmp
+        try:
+            s = main.RealSession(clock=clock, guard=types.SimpleNamespace(active=False))
+            with quiet:
+                ok1 = s.open()
+            check("RealSession：启动前检查没通过 → 不启动", ok1 is False)
+            s.devs = None
+            problems[0] = []
+            s.checked = False
+            with quiet:
+                ok2 = s.open()
+                r = s.run_once()
+            check("RealSession：打开设备并跑一次真机流程（GraspTask.run_once）",
+                  ok2 and r["result"] in ("success", "grasp_failed", "out_of_reach", "align_failed")
+                  and s.task.last_grasp is not None, r["result"])
+            s.task.run_once = lambda: (_ for _ in ()).throw(devices.DeviceError("断线"))
+            try:
+                with quiet:
+                    s.run_once()
+                check("RealSession：设备错误 → 关设备后抛出", False)
+            except devices.DeviceError:
+                check("RealSession：设备错误 → 关设备后抛出", s.devs is None)
+        finally:
+            main.open_devices, main.preflight, main.LOG_DIR = saved
+    finally:
+        importlib.reload(cfg)
+        bench.cfg = main.cfg = cfg
+
+
 # ------------------------------------------------------------ 仿真回归
 def test_sim():
     print("仿真回归（整套流程）")
@@ -763,7 +934,7 @@ if __name__ == "__main__":
     quick = len(sys.argv) > 1 and sys.argv[1] == "quick"
     real_serial = devices.serial
     for t in (test_arm, test_k230, test_lift, test_chassis, test_chassis_fw, test_calib_override,
-              test_step_and_guard, test_geometry, test_ghost, test_sim_factors):
+              test_step_and_guard, test_geometry, test_ghost, test_sim_factors, test_bench):
         try:
             t()
         except Exception as e:
