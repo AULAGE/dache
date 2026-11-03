@@ -185,6 +185,7 @@ POSES = {
 REACH_NEAR_D = 130.0      # [标定] 两个 reach 姿态各自对应的物块深度（observe 姿态下测的，mm）
 REACH_FAR_D = 200.0
 REACH_RANGE_OK = True     # 深度超出这个范围时仍尝试（姿态截断到边界）
+REACH_MARGIN_MM = 25      # 没有底盘时：物块深度超出 [REACH_NEAR_D, REACH_FAR_D]（或只标了一个姿态时 GOAL 深度）±这么多就不抓
 ARM_MOVE_MS = 1000        # 一般动作时间（arm.txt 里每帧都是 1000ms）
 ARM_SLOW_MS = 1200        # 伸向物块时放慢
 # 机械臂 USB 掉线保护（任务 02 仿真发现）：False = 原行为（掉线只重连重发一次，重连后马上又掉会抛
@@ -220,7 +221,7 @@ CALIB_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "calib.
 CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "GOAL", "TOL", "R_CAM_MM", "BASE_DIR", "BASE_CENTER", "BASE_US_PER_DEG", "CLAW_OPEN", "CLAW_CLOSE",
     "REACH_NEAR_D", "REACH_FAR_D", "POSES_CALIBRATED", "ACK_MIN_RADIUS_MM", "K230_ROTATE", "LIFT_MAX_CM",
-    "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "SEARCH_LOOK_FIRST", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
+    "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "SEARCH_LOOK_FIRST", "REACH_MARGIN_MM", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
     "ARM_SLOW_MS", "STEP_ALPHA",
     "CHASSIS_STOP_MODEL", "CHASSIS_CMD_LATENCY_S", "CHASSIS_PI_TAU_S", "CHASSIS_REF_VOLTAGE_V",
     "CHASSIS_CMD_TTL_S", "CHASSIS_YAW_TRIM_DEG_PER_M",

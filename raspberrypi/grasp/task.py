@@ -312,6 +312,27 @@ class GraspTask:
             return True
         return ok
 
+    def reach_range(self):
+        """机械臂（不靠底盘）能抓到的物块深度范围 (近, 远)，单位 mm"""
+        c = self.cfg
+        if c.POSES.get("reach_near") == c.POSES.get("reach_far"):
+            lo = hi = c.GOAL["d"]                    # 只标定了一个伸出姿态：只能抓 GOAL 那个深度
+        else:
+            lo, hi = sorted((c.REACH_NEAR_D, c.REACH_FAR_D))
+        return lo - c.REACH_MARGIN_MM, hi + c.REACH_MARGIN_MM
+
+    def reachable(self, m):
+        """没有底盘时深度不会被对准：物块超出臂展就不去抓（抓了也是空抓）"""
+        if self.cfg.USE_CHASSIS:
+            return True
+        lo, hi = self.reach_range()
+        if lo <= m.d <= hi:
+            return True
+        hint = "往前推近一点" if m.d > hi else "往后挪远一点"
+        self.say(f"够不着：物块深度 {m.d:.0f}mm，机械臂只能抓 {lo:.0f}~{hi:.0f}mm。请把物块{hint}，"
+                 f"或者去掉 --no-chassis 让底盘去对准")
+        return False
+
     def _lift_check(self, m_before, m_after):
         """抬升确认：抓到了物块跟着相机走（y 不变）；没抓到物块留在原地（y 变大或看不见）。None = 判断不了"""
         c = self.cfg
@@ -391,6 +412,9 @@ class GraspTask:
                 self.go_observe()
                 m = self.search()
                 continue
+            if not self.reachable(m_al):
+                result = "out_of_reach"
+                break
             steps += 1
             if self.grasp(m_al):
                 result = "success"
