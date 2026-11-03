@@ -75,8 +75,9 @@ K230 ──串口──►                ┌──► 升降轴 STM32（伺服�
 | `grasp/calib.json` | **标定结果**（`calib.py` 自动写，覆盖 config.py 里的默认值；删掉就恢复默认） |
 | `grasp/calib.py` | 标定工具：watch / goal / jog / auto / teach …… |
 | `grasp/main.py` | 入口：`--check` 自检、`--sim` 仿真、真机运行（`--step` 单步、`--no-chassis`） |
-| `grasp/selftest.py` | 离线自测：假下位机测所有驱动（底盘按固件源码复现）+ 几何前馈 + 仿真回归（48 项）。改完代码先跑它 |
+| `grasp/selftest.py` | 离线自测：假下位机测所有驱动（底盘按固件源码复现）+ 几何前馈 + 仿真回归 + bench.py。改完代码先跑它 |
 | `grasp/chassis_test.py` | 底盘停车精度真机测试：走 ±100mm 各 3 次打印误差、航向漂移（`--model`、`--ruler`、`--timeout-check`），见 `docs/cloud_tasks/results/03_报告.md` |
+| `grasp/bench.py` | **真机试验记录**：按测试矩阵（近/中/远 × 左/中/右）提示放物块 → 自动抓 → 问你真的抓到没有、偏哪边 → 记到 `logs/bench.csv`；`bench.py report` 按位置统计并给出调参建议 |
 | `grasp/report.py` | 看日志：成功率、步数趋势、某次抓取的逐步误差/动作，并给出诊断提示 |
 | `grasp/task.py` | 任务流程：搜索 → 对准 → 抓取 → 确认 → 放置 |
 | `grasp/servo.py` | 自适应视觉伺服 |
@@ -131,6 +132,21 @@ python3 main.py --once --step --no-chassis   # 物块放在臂展内；每个动
 **8. 加上底盘**：物块放远一点（30~60cm），`python3 main.py --once --step` → 没问题再去掉 `--step`
 
 出问题时：`python3 report.py`（最近一次的每一步 + 自动诊断）、`logs/run_*.log`（完整输出）。
+
+**9. 按测试矩阵记录真实结果**（程序说的"抓到了"不算数，以人看到的为准）
+```bash
+python3 bench.py                 # 9 个位置 × 2 次：提示放到哪 → 回车自动抓 → 问"真的抓到了吗"、偏哪边、偏几毫米
+python3 bench.py --positions 2,5,8 --repeat 3   # 只测这几个位置、每个 3 次
+python3 bench.py --resume        # Ctrl+C 退出后接着测没测完的（--positions/--repeat 和上次一样）
+python3 bench.py report          # 最新一轮：3×3 真实成功率、误报、各位置平均偏差、程序结果 vs 真实结果、调参建议
+python3 bench.py --sim           # 不接硬件先练习一遍（记到 logs/bench_sim.csv，不混进真机记录）
+```
+- 位置（俯视、车头朝上）：近/中/远 ≈ 离机械臂底座中心 15/18/21cm；左/右 ≈ 底座转 −10°/+10°（底座右转为正），程序会提示具体往左/右几厘米
+- 默认**无底盘**（相当于 `--no-chassis`），要用底盘加 `--chassis`；`--step` 单步、`--force` 同 main.py
+- 偏差方向：左/右；前 = 爪子落得比物块远、后 = 落得近；高 = 没够到、低 = 压到物块。键盘可以用 `l r f b u d`，可组合（`rf` = 右前）
+- 回答 `r` = 这次不算（例如物块没放好），同一个位置重测；放好物块时输入 `s` 跳过这次、`q` 退出
+- 中途 Ctrl+C：升降轴急停、底盘停车，这一次不记录，之前的都已经写进 `logs/bench.csv`
+- 改了 `calib.py trim` 之后重新开一轮（不加 `--resume`），`report` 默认只看最新一轮；`report --all` 看全部、`report --round <轮次>` 看指定一轮
 
 **注意**
 - 物块放在离车 **90cm 以内**：24mm 的物块再远 K230 识别不出来（仿真里"没找到"的全是这种情况）

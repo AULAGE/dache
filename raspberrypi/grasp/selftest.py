@@ -732,6 +732,141 @@ def test_ghost():
         cfg.USE_CHASSIS = saved
 
 
+# ------------------------------------------------------------ 试验记录工具 bench.py
+def test_bench():
+    print("试验记录工具 bench.py（仿真设备 + 假的键盘输入）")
+    import io
+    import contextlib
+    import config as cfg
+    import bench
+    saved = (cfg.POSES, cfg.USE_CHASSIS)
+    tmp = tempfile.mkdtemp(prefix="bench_")
+    path = os.path.join(tmp, "bench.csv")
+    try:
+        cfg.USE_CHASSIS = False
+        check("位置说明：④ 在左边、底座约 −10°（右转为正）",
+              "往左" in bench.pos_text(4) and "-10°" in bench.pos_text(4) and "18cm" in bench.pos_text(4),
+              bench.pos_text(4))
+        check("--positions 解析（数字 / 圆圈编号）", bench.parse_positions("2,5,8") == [2, 5, 8]
+              and bench.parse_positions("⑤ 9") == [5, 9])
+        check("偏差方向解析", bench.parse_dir("右前") == "右前" and bench.parse_dir("rf") == "右前"
+              and bench.parse_dir("") == "" and bench.parse_dir("左右") is None and bench.parse_dir("x9") is None)
+        check("计划：先每个位置一遍再第二遍；--resume 跳过已测的",
+              bench.make_plan([1, 2], 2) == [(1, 1), (2, 1), (1, 2), (2, 2)]
+              and bench.make_plan([1, 2], 2, {1: 2, 2: 1}) == [(2, 2)])
+
+        rig = bench.SimRig(seed=3)
+        rig.open()
+        state = {"redo": 1, "asked": []}
+
+        def ask(prompt):
+            state["asked"].append(prompt)
+            if "回车开始" in prompt:
+                return ""
+            if "真的抓到" in prompt:
+                if state["redo"]:              # 第一次回答"这次不算，重测"
+                    state["redo"] -= 1
+                    return "r"
+                return "y" if rig.truth else "n"
+            if "偏哪边" in prompt or "居中" in prompt:
+                return "r"
+            if "几毫米" in prompt:
+                return "4mm"
+            return "测试备注"
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            n = bench.run_bench(rig, [1, 9], 1, ask=ask, path=path)
+        rows = bench.load_rows(path)
+        check("跑 2 个位置（其中 1 次选了重测）→ 记 2 条", n == 2 and [r["pos"] for r in rows] == ["1", "9"]
+              and rig.n == 3, f"运行 {rig.n} 次")
+        ok_cols = all(r["base_deg"] and r["d"] and r["t"] and r["trim_deg"] and r["steps"] for r in rows
+                      if r["prog_result"] == "success")
+        check("记录里有对准位置、底座角度、深度插值 t、微调、步数", ok_cols, str({k: rows[0][k] for k in
+                                                                ("prog_result", "x_deg", "d", "base_deg", "t")}))
+        bd = [float(r["base_deg"]) for r in rows if r["base_deg"]]
+        check("左边位置底座角度为负、右边为正（和 config 约定一致）", len(bd) == 2 and bd[0] < -5 and bd[1] > 5, str(bd))
+        check("偏差和备注记下来了", rows[0]["dev_dir"] == "右" and float(rows[0]["dev_mm"]) == 4.0
+              and rows[0]["note"] == "测试备注")
+
+        # 中途 Ctrl+C：急停、不记这一次；--resume 从没测的接着测，并且是同一轮
+        class Interrupt(bench.SimRig):
+            def run_once(self, p=None):
+                if self.n >= 1:
+                    self.n += 1
+                    raise KeyboardInterrupt
+                return super().run_once(p)
+        os.remove(path)
+        rig2 = Interrupt(seed=4)
+        rig2.open()
+        rig = rig2
+        state["redo"] = 0
+        with contextlib.redirect_stdout(io.StringIO()):
+            n = bench.run_bench(rig2, [2, 5, 8], 1, ask=ask, path=path)
+        check("运行中 Ctrl+C → 升降轴急停、已完成的已记录、这一次不记", n == 1 and rig2.emergencies == 1
+              and len(bench.load_rows(path)) == 1)
+        rig = bench.SimRig(seed=5)
+        rig.open()
+        with contextlib.redirect_stdout(io.StringIO()):
+            n = bench.run_bench(rig, [2, 5, 8], 1, resume=True, ask=ask, path=path)
+        rows = bench.load_rows(path)
+        check("--resume 只测剩下的位置、同一轮", n == 2 and [r["pos"] for r in rows] == ["2", "5", "8"]
+              and len({r["round"] for r in rows}) == 1)
+
+        def boom(prompt):
+            raise KeyboardInterrupt
+        with contextlib.redirect_stdout(io.StringIO()):
+            n = bench.run_bench(bench.SimRig(seed=6), [1], 1, ask=boom, path=path)
+        check("等待输入时 Ctrl+C → 正常退出", n == 0)
+
+        # 统计和建议：用构造的记录
+        def rows_of(spec, rnd="R1"):
+            out = []
+            for p, prog, truth, dd, mm in spec:
+                out.append({"round": rnd, "pos": str(p), "prog_result": prog, "truth": truth, "dev_dir": dd,
+                            "dev_mm": "" if mm is None else str(mm), "d": "180", "time_s": "20", "trim_deg": "0.0",
+                            "log": "run_x.log"})
+            return out
+
+        def tips_of(rs):
+            with contextlib.redirect_stdout(io.StringIO()):
+                p2 = os.path.join(tmp, "r.csv")
+                if os.path.exists(p2):
+                    os.remove(p2)
+                for r in rs:
+                    bench.append_row(r, p2)
+                buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                t = bench.report(p2)
+            return t, buf.getvalue()
+
+        spec = [(p, "grasp_failed", "n", "右", 4) for p in (1, 2, 4, 5, 6, 8)] + \
+               [(p, "success", "y", "中", 0) for p in (3, 7, 9)] + [(5, "success", "n", "右", 5)]
+        t, txt = tips_of(rows_of(spec))
+        check("多数位置偏右约 4mm → 建议 calib.py trim 4", any("calib.py trim 4" in x for x in t), "；".join(t))
+        check("误报（程序说抓到、实际没有）计数 + 提示看日志", "误报（程序说抓到、实际没有）1 次" in txt
+              and any("run_x.log" in x for x in t))
+        check("混淆表", "程序结果 vs 真实结果" in txt and "grasp_failed" in txt)
+        spec = [(p, "grasp_failed", "n", "右", 5) for p in (3, 6, 9)] + \
+               [(p, "success", "y", "中", 0) for p in (1, 2, 4, 5, 7, 8)]
+        t, _ = tips_of(rows_of(spec))
+        check("只有右侧位置偏右 → 提示底座回差、任务 09，不建议 trim",
+              any("只有右侧" in x and "任务 09" in x for x in t) and not any("calib.py trim" in x for x in t),
+              "；".join(t))
+        spec = [(p, "grasp_failed", "n", "高", 6) for p in (7, 8, 9)] + \
+               [(p, "success", "y", "中", 0) for p in range(1, 7)]
+        t, _ = tips_of(rows_of(spec))
+        check("只有远处偏高 → 建议 teach far 重标", any("teach far" in x for x in t), "；".join(t))
+        spec = [(p, "grasp_failed", "n", "", None) for p in (4, 5, 6) for _ in range(2)] + \
+               [(p, "success", "y", "中", 0) for p in (1, 2, 3, 7, 8, 9) for _ in range(2)]
+        t, _ = tips_of(rows_of(spec))
+        check("中间深度没抓到、两端抓到 → 建议 reach_mid", any("reach_mid" in x for x in t), "；".join(t))
+        rs = rows_of([(5, "success", "y", "中", 0)], "R1") + rows_of([(5, "grasp_failed", "n", "", None)], "R2")
+        _, txt = tips_of(rs)
+        check("report 默认只统计最新一轮", "第 R2 轮" in txt and "共 1 次：真实抓到 0 次" in txt)
+    finally:
+        cfg.POSES, cfg.USE_CHASSIS = saved
+
+
 # ------------------------------------------------------------ 仿真回归
 def test_sim():
     print("仿真回归（整套流程）")
@@ -763,7 +898,7 @@ if __name__ == "__main__":
     quick = len(sys.argv) > 1 and sys.argv[1] == "quick"
     real_serial = devices.serial
     for t in (test_arm, test_k230, test_lift, test_chassis, test_chassis_fw, test_calib_override,
-              test_step_and_guard, test_geometry, test_ghost, test_sim_factors):
+              test_step_and_guard, test_geometry, test_ghost, test_sim_factors, test_bench):
         try:
             t()
         except Exception as e:

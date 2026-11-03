@@ -340,6 +340,11 @@ class GraspTask:
         trim = c.GRASP_BASE_TRIM_DEG
         bp = self.base_pulse(max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, self.base_deg + trim)))
 
+        # 只记录不影响流程：bench.py 把这些和人工记录的真实结果放在一起统计
+        pos = getattr(self.lift, "pos", None)
+        self.last_grasp = {"x_deg": round(m.x_deg, 2), "y": round(m.y, 1), "d": round(m.d, 1),
+                           "base_deg": round(self.base_deg, 2), "lift_cm": None if pos is None else round(pos, 2),
+                           "t": round(t, 3), "trim_deg": trim}
         self.say(f"抓取：深度 {m.d:.0f}mm，插值 t={max(0.0, min(1.0, t)):.2f}，底座 {self.base_deg:+.1f}°"
                  + (f"（微调 {trim:+.1f}°）" if trim else ""))
         self.arm.move({c.CLAW_ID: c.CLAW_OPEN}, 300)
@@ -469,6 +474,8 @@ class GraspTask:
         attempts = 0
         result = "not_found"
         last_err = None
+        self.last_grasp = None          # 本次最后一次伸出抓取时的状态（没伸出过就是 None）
+        self.last_aligned = None        # 本次最后一次对准结束时的测量
 
         self.go_observe(0)
         m = self.search()
@@ -477,6 +484,7 @@ class GraspTask:
             ok, m_al, n = self.align(m)
             steps += n
             if m_al is not None:
+                self.last_aligned = m_al
                 last_err = m_al.err(self.goal_for(m_al))
             if not ok and getattr(self, "_abort", None):
                 result = self._abort
