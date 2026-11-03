@@ -14,7 +14,7 @@ import math
 import os
 
 from devices import DeviceError, ManualOverride, lerp_pose
-from servo import build_axes, save_axes
+from servo import NOISE, build_axes, save_axes
 
 
 class GraspTask:
@@ -188,6 +188,8 @@ class GraspTask:
     def align(self, m):
         """闭环对准。返回 (是否对准, 最后一次测量, 用了几步)"""
         c = self.cfg
+        self._abort = None
+        strikes = {"y": 0, "x_deg": 0}          # 连续几次"动了但读数几乎没变"
         for step in range(c.MAX_ALIGN_STEPS):
             if m is None:
                 self.say("对准：目标丢失")
@@ -236,6 +238,15 @@ class GraspTask:
                     f"前进{u_d:+.0f}mm" if u_d else "",
                     f"车头往底座方向拐" if recenter else ""] if s)))
 
+            # 升降轴已经到头、还要往外走：再怎么调也够不着这个高度，别在原地来回试
+            pos = getattr(self.lift, "pos", None)
+            if u_y and pos is not None and abs(e["y"]) > 2 * c.TOL["y"] and (
+                    (u_y < 0 and pos <= 0.05) or (u_y > 0 and pos >= c.LIFT_MAX_CM - 0.05)):
+                self.say(f"对准：升降轴已经到{'最低' if u_y < 0 else '最高'}（{pos:.1f}cm），"
+                         f"还差 y={e['y']:+.0f}mm，这个高度够不着")
+                self._abort = "lift_limit"
+                return False, m, step
+
             # 执行：升降轴和底盘 / 底座同时动
             if u_y:
                 self.lift.start_move_by(u_y)
@@ -262,6 +273,23 @@ class GraspTask:
             far = any(abs(e[k]) > 4 * c.TOL[k] for k in self.axis_names)
             m2 = self.measure(c.SAMPLE_N_FAR if far else None)
 
+            if m2 is not None and c.GHOST_CHECK:
+                e2 = m2.err(goal)
+                checks = []
+                if u_y:
+                    checks.append(("y", self.axes["y"].j * u_y, e2["y"] - e["y"], max(6.0, 3 * NOISE["y"])))
+                if u_x and not recenter and not u_d:
+                    checks.append(("x_deg", self.axes["x_deg"].j * s_x * u_x, e2["x_deg"] - e["x_deg"], 1.5))
+                for ax, pred, got, thresh in checks:
+                    if abs(pred) >= thresh:
+                        strikes[ax] = strikes[ax] + 1 if abs(got) < 0.3 * abs(pred) else 0
+                if max(strikes.values()) >= 2:
+                    what = "升降轴" if strikes["y"] >= 2 else "底座"
+                    self.say(f"对准：{what}动了两次，物块的读数几乎没变 → K230 识别到的很可能是机械臂自己"
+                             f"（例如爪子），停止。请在 IDE 画面里看识别框框在哪")
+                    self._abort = "ghost"
+                    return False, m2, step + 1
+
             if m2 is not None and self.learn:
                 e2 = m2.err(goal)
                 # 只学习没有被别的动作干扰的轴
@@ -274,6 +302,7 @@ class GraspTask:
 
             self._append_csv("steps.csv", {
                 "episode": self.episode, "step": step + 1, "base_deg": round(base_old, 1),
+                "lift_cm": None if pos is None else round(pos, 2),
                 **{f"e_{n}": round(e[n], 2) for n in self.axis_names},
                 "u_y": round(u_y, 3), "u_x": round(u_x, 2), "u_d": round(u_d, 1), "recenter": int(recenter),
                 **{f"J_{n}": round(self.axes[n].j, 4) for n in self.axis_names}})
@@ -306,6 +335,8 @@ class GraspTask:
 
         if verify == "none":
             return True
+        if verify == "observe":                  # 只做观察确认（爪子在画面里时抬升确认会被骗）
+            return self._observe_check(bp)
         ok = self._lift_check(m_before, m_after)
         if ok is None and verify == "auto":
             ok = self._observe_check(bp)
@@ -426,6 +457,10 @@ class GraspTask:
             steps += n
             if m_al is not None:
                 last_err = m_al.err(self.goal_for(m_al))
+            if not ok and getattr(self, "_abort", None):
+                result = self._abort
+                self.go_observe()
+                break
             if not ok:
                 result = "lost" if m_al is None else "align_failed"
                 self.go_observe()

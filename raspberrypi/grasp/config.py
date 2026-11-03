@@ -187,6 +187,8 @@ REACH_FAR_D = 200.0
 REACH_RANGE_OK = True     # 深度超出这个范围时仍尝试（姿态截断到边界）
 # reach_far 那次 teach 时观察姿态下看到的物块位置（calib.py teach 自动保存）；没有底盘时目标按深度在 GOAL 和它之间插值
 GOAL_FAR = None
+# 对准时动了执行器、读数却几乎不变（< 30% 预期），连续 2 次 → 判定 K230 识别到的是机械臂自己，停止
+GHOST_CHECK = True
 REACH_MARGIN_MM = 25      # 没有底盘时：物块深度超出 [REACH_NEAR_D, REACH_FAR_D]（或只标了一个姿态时 GOAL 深度）±这么多就不抓
 ARM_MOVE_MS = 1000        # 一般动作时间（arm.txt 里每帧都是 1000ms）
 ARM_SLOW_MS = 1200        # 伸向物块时放慢
@@ -200,6 +202,7 @@ LIFT_AFTER_GRASP_CM = 5.0 # 合爪后升降轴上抬多少
 #                 物块留在原地（y 明显变大或看不见了）= 没抓到。伸出后物块离相机太近看不到时判断不了，按成功处理
 #   "auto"        先做 lift_check；判断不了时再做"观察确认"：爪子闭合退回观察姿态、升降轴降回原高度，
 #                 原位置还能看到物块 = 没抓到（多花 3~4 秒，但不会把没抓到当成功）
+#   "observe"     只做观察确认（爪子会出现在画面里时用：抬升确认会把爪子当成物块，永远判"抓到"）
 #   "none"        不判断
 VERIFY = "auto"
 VERIFY_DY_MM = 15.0       # 抬升后 y 变化小于这个值算抓到
@@ -223,7 +226,7 @@ CALIB_FILE = _os.environ.get("GRASP_CALIB_FILE") or     _os.path.join(_os.path.d
 CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "GOAL", "TOL", "R_CAM_MM", "BASE_DIR", "BASE_CENTER", "BASE_US_PER_DEG", "CLAW_OPEN", "CLAW_CLOSE",
     "REACH_NEAR_D", "REACH_FAR_D", "POSES_CALIBRATED", "ACK_MIN_RADIUS_MM", "K230_ROTATE", "LIFT_MAX_CM",
-    "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "SEARCH_LOOK_FIRST", "REACH_MARGIN_MM", "GOAL_FAR", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
+    "LIFT_AFTER_GRASP_CM", "VERIFY", "USE_CHASSIS", "SEARCH_LOOK_FIRST", "REACH_MARGIN_MM", "GOAL_FAR", "GHOST_CHECK", "PIVOT_FWD_MM", "GEOM_FEEDFORWARD", "ARM_MOVE_MS",
     "ARM_SLOW_MS", "STEP_ALPHA",
     "CHASSIS_STOP_MODEL", "CHASSIS_CMD_LATENCY_S", "CHASSIS_PI_TAU_S", "CHASSIS_REF_VOLTAGE_V",
     "CHASSIS_CMD_TTL_S", "CHASSIS_YAW_TRIM_DEG_PER_M",

@@ -680,6 +680,52 @@ def test_sim_factors():
         importlib.reload(cfg)
 
 
+# ------------------------------------------------------------ 假目标（机械臂自己）/ 升降轴到头
+def test_ghost():
+    print("识别到机械臂自己 / 升降轴到头")
+    import config as cfg
+    from task import GraspTask
+
+    class Clock:
+        t = 0.0
+        def now(self): return self.t
+        def sleep(self, s): self.t += max(0.0, s)
+
+    class GhostCam:                     # 读数永远不变：K230 盯着爪子
+        def __init__(self, x, y, d): self.m = devices.Measurement(x, y, d, 5)
+        def measure(self, since, n, timeout): return self.m
+
+    class Lift:
+        def __init__(self, pos): self.pos = pos; self.moves = []
+        def start_move_by(self, cm): self.moves.append(cm); self.pos = max(0.0, min(44.0, self.pos + cm))
+        def wait_move(self, timeout=30): return self.pos
+        def move_by(self, cm, timeout=30): self.start_move_by(cm); return self.pos
+        def move_to(self, cm, timeout=30): self.pos = cm; return cm
+
+    class Arm:
+        def move(self, pulses, ms): pass
+
+    saved = cfg.USE_CHASSIS
+    try:
+        cfg.USE_CHASSIS = False
+        g = cfg.GOAL
+        # y 偏 +30mm、x 偏 +6°，读数不变 → 应该两三步内判"ghost"，升降轴不会一路降到底
+        lift = Lift(20.0)
+        t = GraspTask(cfg, Clock(), GhostCam(math.tan(math.radians(g["x_deg"] + 6)) * g["d"], g["y"] + 30, g["d"]),
+                      lift, Arm(), None, verbose=False, learn=False)
+        ok, m, n = t.align(t.cam.m)
+        check("读数不随动作变化 → 判定识别到机械臂自己并停止", not ok and t._abort == "ghost" and n <= 3,
+              f"步数 {n}，升降轴共动了 {sum(lift.moves):+.1f}cm")
+        check("停下前升降轴没有一路降到底", lift.pos > 10, f"{lift.pos:.1f}cm")
+        # 升降轴已经在最低点、还要往下 → 判"lift_limit"
+        lift = Lift(0.0)
+        t = GraspTask(cfg, Clock(), GhostCam(0, g["y"] + 30, g["d"]), lift, Arm(), None, verbose=False, learn=False)
+        ok, m, n = t.align(t.cam.m)
+        check("升降轴到最低点还要往下 → 判定够不着", not ok and t._abort == "lift_limit" and not lift.moves)
+    finally:
+        cfg.USE_CHASSIS = saved
+
+
 # ------------------------------------------------------------ 仿真回归
 def test_sim():
     print("仿真回归（整套流程）")
@@ -711,7 +757,7 @@ if __name__ == "__main__":
     quick = len(sys.argv) > 1 and sys.argv[1] == "quick"
     real_serial = devices.serial
     for t in (test_arm, test_k230, test_lift, test_chassis, test_chassis_fw, test_calib_override,
-              test_step_and_guard, test_geometry, test_sim_factors):
+              test_step_and_guard, test_geometry, test_ghost, test_sim_factors):
         try:
             t()
         except Exception as e:
