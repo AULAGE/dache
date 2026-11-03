@@ -2,8 +2,8 @@
 
 
 			
-uint16 ServoPwmDuty[8] = {1500,500,1500,758,601,1185,1500,1500};	/* power-on pose = arm.txt initial pose (claw open). Was 3,4,5 = 500: servo 4 hit its mechanical limit and jittered until the Pi sent a pose */
-uint16 ServoPwmDutySet[8] = {1500,500,1500,758,601,1185,1500,1500};
+uint16 ServoPwmDuty[8] = {1500,1500,1500,758,601,1185,1500,1500};	/* power-on pose = arm.txt initial pose (= observe pose, claw 1500 mid-travel). Was 3,4,5 = 500: servo 4 hit its mechanical limit and jittered */
+uint16 ServoPwmDutySet[8] = {1500,1500,1500,758,601,1185,1500,1500};
 float  ServoPwmDutyInc[8];		//为了速度控制，当PWM脉宽发生变化时，每2.5ms或20ms递增的PWM脉宽
 
 bool ServoPwmDutyHaveChange = FALSE;	//脉宽有变化标志位
