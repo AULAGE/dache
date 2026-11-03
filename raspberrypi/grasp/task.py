@@ -12,6 +12,7 @@
 import csv
 import math
 import os
+import time
 
 from devices import DeviceError, ManualOverride, lerp_pose
 from servo import NOISE, build_axes, save_axes
@@ -64,6 +65,14 @@ class GraspTask:
             return
         path = os.path.join(self.log_dir, name)
         new = not os.path.exists(path)
+        if not new:
+            # 列变了（程序升级加了新列）：旧文件改名留档，开一个新文件，否则新行会和旧表头错位
+            with open(path, newline="", encoding="utf-8") as f:
+                header = next(csv.reader(f), [])
+            if header != list(row.keys()):
+                base, ext = os.path.splitext(path)
+                os.replace(path, f"{base}_{time.strftime('%Y%m%d_%H%M%S')}{ext}")
+                new = True
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(row.keys()))
             if new:
@@ -318,9 +327,12 @@ class GraspTask:
         if not 0 <= t <= 1 and not c.REACH_RANGE_OK:
             raise DeviceError(f"物块深度 {m.d:.0f}mm 超出机械臂范围")
         reach = lerp_pose(c.POSES["reach_near"], c.POSES["reach_far"], t)
-        bp = self.base_pulse()
+        # 左右微调：对准后爪子系统性偏左/偏右时，伸出前让底座多转一点（calib.py trim 设置）
+        trim = c.GRASP_BASE_TRIM_DEG
+        bp = self.base_pulse(max(-c.BASE_LIMIT_DEG, min(c.BASE_LIMIT_DEG, self.base_deg + trim)))
 
-        self.say(f"抓取：深度 {m.d:.0f}mm，插值 t={max(0.0, min(1.0, t)):.2f}，底座 {self.base_deg:+.1f}°")
+        self.say(f"抓取：深度 {m.d:.0f}mm，插值 t={max(0.0, min(1.0, t)):.2f}，底座 {self.base_deg:+.1f}°"
+                 + (f"（微调 {trim:+.1f}°）" if trim else ""))
         self.arm.move({c.CLAW_ID: c.CLAW_OPEN}, 300)
         self.arm.move({**c.POSES["ready"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
         self.arm.move({**reach, c.BASE_ID: bp}, c.ARM_SLOW_MS)

@@ -16,6 +16,7 @@
   python3 calib.py auto                半自动：测升降轴方向/灵敏度、底座方向、相机半径（需要物块在画面里）
   python3 calib.py teach               引导式标定抓取位置：GOAL、REACH_NEAR_D（倒推法）
   python3 calib.py done                全部标定完：把 POSES_CALIBRATED 设为 true
+  python3 calib.py trim 6              左右微调：爪子落点偏右 6mm（偏左写负数，可累加；trim reset 清零）
   python3 calib.py shake [姿态]        摆到某个姿态（不写 = 原地不动）静止 6 秒，用 K230 读数量机械臂抖多厉害
 """
 import json
@@ -358,6 +359,27 @@ def shake(name, seconds=6.0):
     return worst
 
 
+def trim(args):
+    """
+    左右微调：calib.py trim <偏右毫米> [物块深度mm，默认 180]
+      爪子落点比物块中心偏右 6mm → calib.py trim 6（偏左就写负数）；可以多次累加；calib.py trim reset 清零
+    """
+    cur = float(load_calib().get("GRASP_BASE_TRIM_DEG", cfg.GRASP_BASE_TRIM_DEG))
+    if not args:
+        print(f"当前左右微调：{cur:+.2f}°（底座右转为正）")
+        return
+    if args[0] == "reset":
+        save_calib({"GRASP_BASE_TRIM_DEG": 0.0})
+        return
+    mm = float(args[0])
+    depth = float(args[1]) if len(args) > 1 else 180.0
+    delta = -math.degrees(math.atan2(mm, depth))       # 偏右 → 往左（负）补
+    new = round(cur + delta, 2)
+    print(f"爪子偏{'右' if mm > 0 else '左'} {abs(mm):.0f}mm（按深度 {depth:.0f}mm 算）→ 底座多转 {delta:+.2f}°，"
+          f"微调从 {cur:+.2f}° 改为 {new:+.2f}°")
+    save_calib({"GRASP_BASE_TRIM_DEG": new})
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__)
@@ -393,6 +415,8 @@ def main(argv):
         teach()
     elif cmd == "done":
         save_calib({"POSES_CALIBRATED": True})
+    elif cmd == "trim":
+        trim(args)
     elif cmd == "shake":
         shake(args[0] if args else "now", float(args[1]) if len(args) > 1 else 6.0)
     else:
