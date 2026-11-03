@@ -80,6 +80,7 @@ K230 ──串口──►                ┌──► 升降轴 STM32（伺服�
 | `grasp/test_chassis_rehearsal.py` | 有底盘联调预演（仿真）：物块车前 300~700mm 的成功率 / 里程 / 后退 / 危险动作统计 + 危险动作回归测试（selftest 会调用） |
 | `grasp/bench.py` | **真机试验记录**：按测试矩阵（近/中/远 × 左/中/右）提示放物块 → 自动抓 → 问你真的抓到没有、偏哪边 → 记到 `logs/bench.csv`；`bench.py report` 按位置统计并给出调参建议 |
 | `grasp/recorder.py` | **论文数据记录**：`main.py --record` 时记录每条动作命令和 K230 每一帧；`recorder.py backlash/pairs` 离线分析回差、抽样本对。测试 `test_recorder.py` |
+| `grasp/demo.py` `grasp/dashboard.py` | **比赛演示**：`demo.py --no-chassis --rounds 5 [--dashboard] [--record]` 连续抓取、大号状态行、结束统计；`--dashboard`（`main.py` 也能加）开网页看板 `http://<树莓派IP>:8080`。测试 `test_demo.py`，说明见 `docs/cloud_tasks/results/16_报告.md` |
 | `grasp/report.py` | 看日志：成功率、步数趋势、某次抓取的逐步误差/动作，并给出诊断提示 |
 | `grasp/task.py` | 任务流程：搜索 → 对准 → 抓取 → 确认 → 放置 |
 | `grasp/servo.py` | 自适应视觉伺服 |

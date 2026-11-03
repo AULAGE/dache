@@ -287,6 +287,12 @@ SCORE_TIME_COST = 0.5
 
 LOG_DIR = "logs"
 
+# ======================= 演示模式 / 网页看板（任务 16，默认都不开） =======================
+DASHBOARD_PORT = 8080         # main.py / demo.py 加 --dashboard 时网页看板的端口
+DEMO_AUTO_INTERVAL_S = None   # demo.py 两轮之间自动等几秒；None = 等操作员按回车（命令行 --auto 覆盖）
+DEMO_TTS_CMD = None           # 语音播报命令，None = 不播报。"{text}" 换成要说的话，没写 {text} 就把话加在最后
+                              # 例："espeak-ng -v zh -s 160 {text}"，或列表 ["espeak-ng", "-v", "zh", "{text}"]
+
 # ======================= 标定结果覆盖 =======================
 # calib.py 把标定结果写进同目录的 calib.json，这里自动加载并覆盖上面的默认值——不用手改本文件。
 # 想恢复默认：删掉 calib.json（或里面的某一项）即可。
@@ -308,6 +314,7 @@ CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "TRIM_LEARN", "TRIM_LEARN_RATE", "TRIM_MAX_DEG", "TRIM_LEARN_EDGES", "REACH_MID_D", "GOAL_MID",
     "GHOST_FINGERPRINT", "GHOST_FP_TOL", "GHOST_FP_MIN_HITS", "GHOST_FP_MAX",
     "K230_SYNC_PORT", "K230_SYNC_PERIOD_S",
+    "DASHBOARD_PORT", "DEMO_AUTO_INTERVAL_S", "DEMO_TTS_CMD",
 }
 
 

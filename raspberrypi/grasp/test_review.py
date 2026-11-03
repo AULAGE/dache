@@ -203,6 +203,7 @@ def last_chassis_frame(path):
     return int.from_bytes(f[3:5], "big", signed=True), int.from_bytes(f[7:9], "big", signed=True)
 
 
+@unittest.skipIf(sys.platform.startswith("win"), "Windows 上 SIGTERM 无法被捕获、没有 SIGHUP；树莓派（Linux）上照常测")
 class TestStopSignals(unittest.TestCase):
     """报告 [伤硬件-2]（修复）：systemctl stop / SSH 断开时底盘最后一帧不是停车帧"""
 
