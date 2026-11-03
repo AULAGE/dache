@@ -16,6 +16,7 @@
   python3 calib.py auto                半自动：测升降轴方向/灵敏度、底座方向、相机半径（需要物块在画面里）
   python3 calib.py teach               引导式标定抓取位置：GOAL、REACH_NEAR_D（倒推法）
   python3 calib.py done                全部标定完：把 POSES_CALIBRATED 设为 true
+  python3 calib.py shake [姿态]        摆到某个姿态（不写 = 原地不动）静止 6 秒，用 K230 读数量机械臂抖多厉害
 """
 import json
 import math
@@ -308,6 +309,38 @@ def teach():
             save_calib(upd)
 
 
+def shake(name, seconds=6.0):
+    """
+    抖动测量：相机在腕部，机械臂一抖，静止物块的读数就跟着抖。
+    摆到某个姿态、静止 seconds 秒，统计 K230 读数的波动（物块要放着别动）。
+    """
+    cam = open_cam()
+    if name != "now":
+        arm_move(pose_pulses(name), 1500)
+        time.sleep(1.0)                      # 等动作完全结束
+    print(f"保持 {seconds:.0f} 秒不动，测量中……")
+    t0 = time.monotonic()
+    time.sleep(seconds)
+    fr = [f for f in cam.frames if f[0] >= t0]
+    if len(fr) < 5:
+        print(f"只收到 {len(fr)} 帧：物块没被识别到 / 碰到画面边缘，或者抖得太厉害一直丢目标")
+        return None
+    xs = [f[1] for f in fr]
+    ys = [f[2] for f in fr]
+    ds = [f[3] for f in fr]
+    sx, sy, sd = statistics.pstdev(xs), statistics.pstdev(ys), statistics.pstdev(ds)
+    print(f"{len(fr)} 帧：X 标准差 {sx:.1f}mm（峰峰 {max(xs) - min(xs)}）  "
+          f"Y 标准差 {sy:.1f}mm（峰峰 {max(ys) - min(ys)}）  深度标准差 {sd:.1f}mm")
+    worst = max(sx, sy)
+    if worst < 1.5:
+        print("→ 基本不抖（这个量级是 K230 自身的测量噪声）")
+    elif worst < 4:
+        print("→ 轻微抖动")
+    else:
+        print("→ 明显抖动：先查舵机供电（电压、电流够不够、地线），再看这个姿态是不是顶到了机械限位")
+    return worst
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__)
@@ -343,6 +376,8 @@ def main(argv):
         teach()
     elif cmd == "done":
         save_calib({"POSES_CALIBRATED": True})
+    elif cmd == "shake":
+        shake(args[0] if args else "now", float(args[1]) if len(args) > 1 else 6.0)
     else:
         print(__doc__)
 
