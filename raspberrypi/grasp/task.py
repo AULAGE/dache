@@ -47,6 +47,9 @@ class GraspTask:
         self._probe_mm = 0.0             # 这次伸出的左右试探量（mm，偏右为正）
         self.trim_path = os.path.join(log_dir, cfg.TRIM_LEARN_FILE) if log_dir else None
         self.trim_state = self._load_trim() if cfg.TRIM_LEARN else None
+        # ghost 指纹（任务 10）：之前判定为"机械臂自己"的读数
+        self.ghost_path = os.path.join(log_dir, cfg.GHOST_FP_FILE) if log_dir else None
+        self.ghosts = self._load_ghosts() if cfg.GHOST_FINGERPRINT else []
 
     # ------------------------------------------------ 工具
     def say(self, *a):
@@ -63,7 +66,90 @@ class GraspTask:
         link_ok = getattr(self.cam, "link_ok", None)
         if m is None and link_ok is not None and not link_ok(2.0):
             raise DeviceError("K230 没有任何数据（连心跳都没有）：检查 K230 串口线和程序")
+        if m is not None and self.ghost_match(m):
+            return None
         return m
+
+    # ------------------------------------------------ ghost 指纹（任务 10）
+    def _load_ghosts(self):
+        if not self.ghost_path or not os.path.exists(self.ghost_path):
+            return []
+        try:
+            with open(self.ghost_path, encoding="utf-8") as f:
+                data = json.load(f)
+            out = []
+            for g in data.get("ghosts", []):
+                out.append({"x_deg": float(g["x_deg"]), "y": float(g["y"]), "d": float(g["d"]),
+                            "hits": int(g.get("hits", 1)), "first": g.get("first", ""),
+                            "last": g.get("last", ""), "seen": int(g.get("seen", 0))})
+            return out
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+            print(f"ghost 指纹文件 {self.ghost_path} 读不了（{e}），忽略它")
+            return []
+
+    def _save_ghosts(self):
+        if not self.ghost_path:
+            return
+        tmp = self.ghost_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"note": "align 判定为机械臂自己（ghost）时的 K230 读数；误记了删掉这个文件或其中一项",
+                       "tol": self.cfg.GHOST_FP_TOL, "ghosts": self.ghosts}, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.ghost_path)
+
+    def _ghost_near(self, m):
+        """和读数 m 最接近（各轴都在容差内）的指纹，没有返回 (None, None)"""
+        tol = self.cfg.GHOST_FP_TOL
+        best, best_v = None, None
+        for i, g in enumerate(self.ghosts):
+            r = max(abs(m.x_deg - g["x_deg"]) / tol["x_deg"], abs(m.y - g["y"]) / tol["y"],
+                    abs(m.d - g["d"]) / tol["d"])
+            if r <= 1.0 and (best_v is None or r < best_v):
+                best, best_v = i, r
+        return best, best_v
+
+    def record_ghost(self, m):
+        """align 判定 ghost 时调用：把读数记成指纹（和已有指纹接近就合并、命中次数 +1）"""
+        c = self.cfg
+        if not c.GHOST_FINGERPRINT or m is None:
+            return None
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        i, _ = self._ghost_near(m)
+        if i is None:
+            if len(self.ghosts) >= max(1, c.GHOST_FP_MAX):
+                self.ghosts.sort(key=lambda g: g["last"])
+                self.ghosts.pop(0)
+            self.ghosts.append({"x_deg": round(m.x_deg, 2), "y": round(m.y, 1), "d": round(m.d, 1),
+                                "hits": 1, "first": now, "last": now, "seen": 0})
+            g = self.ghosts[-1]
+        else:
+            g = self.ghosts[i]
+            k = g["hits"]
+            for key, v in (("x_deg", m.x_deg), ("y", m.y), ("d", m.d)):     # 平均一下，指纹更准
+                g[key] = round((g[key] * k + v) / (k + 1), 2)
+            g["hits"] = k + 1
+            g["last"] = now
+        self.say(f"记录 ghost 指纹：x={g['x_deg']:+.1f}° y={g['y']:+.0f}mm d={g['d']:.0f}mm（第 {g['hits']} 次）"
+                 + (f" → {self.ghost_path}" if self.ghost_path else ""))
+        try:
+            self._save_ghosts()
+        except OSError as e:
+            self.say(f"ghost 指纹保存失败：{e}")
+        return g
+
+    def ghost_match(self, m):
+        """读数 m 是不是之前记录的假目标（GHOST_FINGERPRINT 关掉时永远 False）"""
+        c = self.cfg
+        if not c.GHOST_FINGERPRINT or m is None or not self.ghosts:
+            return False
+        i, _ = self._ghost_near(m)
+        if i is None or self.ghosts[i]["hits"] < c.GHOST_FP_MIN_HITS:
+            return False
+        g = self.ghosts[i]
+        g["seen"] = g.get("seen", 0) + 1
+        self.say(f"看到的是之前记录的假目标（ghost 指纹 #{i + 1}：x={g['x_deg']:+.1f}° y={g['y']:+.0f}mm "
+                 f"d={g['d']:.0f}mm，记录于 {g['first']}），当作没看到。"
+                 f"如果这其实是真物块，删掉 {self.ghost_path or 'ghosts.json'}")
+        return True
 
     def in_tol(self, e):
         return all(abs(e[n]) <= self.cfg.TOL[n] for n in self.axis_names)
@@ -346,6 +432,7 @@ class GraspTask:
                     self.say(f"对准：{what}动了两次，物块的读数几乎没变 → K230 识别到的很可能是机械臂自己"
                              f"（例如爪子），停止。请在 IDE 画面里看识别框框在哪")
                     self._abort = "ghost"
+                    self.record_ghost(m2)
                     return False, m2, step + 1
 
             if m2 is not None and self.learn:

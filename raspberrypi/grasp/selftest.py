@@ -732,6 +732,122 @@ def test_ghost():
         cfg.USE_CHASSIS = saved
 
 
+# ------------------------------------------------------------ ghost 指纹（任务 10）
+def test_ghost_fingerprint():
+    print("ghost 指纹（GHOST_FINGERPRINT）")
+    import json
+    import shutil
+    import tempfile
+    import config as cfg
+    from task import GraspTask
+
+    class Clock:
+        t = 0.0
+        def now(self): return self.t
+        def sleep(self, s): self.t += max(0.0, s)
+
+    class Cam:                          # 依次返回给定的读数；用完了一直返回最后一个
+        def __init__(self, *ms): self.ms = list(ms)
+        def measure(self, since, n, timeout):
+            return self.ms.pop(0) if len(self.ms) > 1 else self.ms[0]
+
+    class Lift:
+        pos = 20.0
+        def start_move_by(self, cm): self.pos += cm
+        def wait_move(self, timeout=30): return self.pos
+        def move_to(self, cm, timeout=30): self.pos = cm; return cm
+
+    class Arm:
+        def move(self, pulses, ms): pass
+
+    saved = (cfg.USE_CHASSIS, cfg.GHOST_FINGERPRINT)
+    tmp = tempfile.mkdtemp(prefix="ghost_fp_")
+    try:
+        cfg.USE_CHASSIS = False
+        g = cfg.GOAL
+        x_of = lambda deg, d: math.tan(math.radians(deg)) * d
+        ghost = devices.Measurement(x_of(g["x_deg"] + 6, g["d"]), g["y"] + 30, g["d"], 5)
+        path = os.path.join(tmp, cfg.GHOST_FP_FILE)
+
+        def task(*ms):
+            return GraspTask(cfg, Clock(), Cam(*ms), Lift(), Arm(), None, log_dir=tmp, verbose=False, learn=False)
+
+        # 关着（默认）：判定 ghost 也不写文件、不过滤
+        cfg.GHOST_FINGERPRINT = False
+        check("默认关闭", saved[1] is False)
+        t = task(ghost)
+        ok, m, n = t.align(ghost)
+        check("关闭时：判 ghost 但不记指纹", t._abort == "ghost" and not os.path.exists(path))
+        check("关闭时：ghost 读数照常返回", t.measure() is ghost)
+
+        # 打开：判定 ghost -> 记到 ghosts.json
+        cfg.GHOST_FINGERPRINT = True
+        t = task(ghost)
+        ok, m, n = t.align(ghost)
+        data = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
+        gs = data.get("ghosts", [])
+        check("打开时：判 ghost 后记下指纹（x_deg、y、d）", t._abort == "ghost" and len(gs) == 1
+              and abs(gs[0]["x_deg"] - ghost.x_deg) < 0.05 and abs(gs[0]["y"] - ghost.y) < 0.1
+              and abs(gs[0]["d"] - ghost.d) < 0.1, str(gs))
+
+        # 新的一次运行（重新加载文件）：接近指纹的读数当作没看到，并提示
+        near = devices.Measurement(x_of(ghost.x_deg + 1.0, ghost.d + 10), ghost.y - 4, ghost.d + 10, 5)
+        far = devices.Measurement(x_of(g["x_deg"], g["d"]), g["y"], g["d"], 5)
+        buf = []
+        t = task(ghost, near, far)
+        t.verbose = True
+        import builtins
+        real_print = builtins.print
+        builtins.print = lambda *a, **k: buf.append(" ".join(str(x) for x in a))
+        try:
+            r1, r2, r3 = t.measure(), t.measure(), t.measure()
+        finally:
+            builtins.print = real_print
+        check("重新加载后：同样的读数当作没看到", r1 is None)
+        check("容差内的读数也当作没看到", r2 is None)
+        check("离指纹远的读数（真物块）照常返回", r3 is far)
+        check("提示“看到的是之前记录的假目标”", any("之前记录的假目标" in b for b in buf), buf[0] if buf else "")
+        # 只有 ghost 时：搜索找不到（不会再锁着假目标去对准）
+        t = task(ghost)
+        check("只看得到假目标时搜索返回 None", t.search() is None)
+
+        # 再判一次接近的 ghost：合并到同一个指纹、命中次数 +1
+        t = task(near)
+        t.record_ghost(near)
+        gs = json.load(open(path, encoding="utf-8"))["ghosts"]
+        check("接近的 ghost 合并到已有指纹", len(gs) == 1 and gs[0]["hits"] == 2, str(gs))
+        t.record_ghost(far)
+        gs = json.load(open(path, encoding="utf-8"))["ghosts"]
+        check("不同位置的 ghost 另记一个", len(gs) == 2)
+
+        # GHOST_FP_MIN_HITS：命中次数不够时不过滤
+        saved_min = cfg.GHOST_FP_MIN_HITS
+        try:
+            cfg.GHOST_FP_MIN_HITS = 3
+            t = task(ghost)
+            check("命中次数 < GHOST_FP_MIN_HITS 时不过滤", t.measure() is ghost)
+        finally:
+            cfg.GHOST_FP_MIN_HITS = saved_min
+
+        # 文件坏了：不崩溃，当作没有指纹
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{坏了")
+        with contextlib_quiet():
+            t = task(ghost)
+        check("ghosts.json 损坏时不崩溃、不过滤", t.ghosts == [] and t.measure() is ghost)
+        check("新参数在 calib.json 白名单里", {"GHOST_FINGERPRINT", "GHOST_FP_TOL", "GHOST_FP_MIN_HITS",
+                                               "GHOST_FP_MAX"} <= cfg.CALIB_KEYS)
+    finally:
+        cfg.USE_CHASSIS, cfg.GHOST_FINGERPRINT = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def contextlib_quiet():
+    import contextlib
+    import io
+    return contextlib.redirect_stdout(io.StringIO())
+
+
 # ------------------------------------------------------------ 试验记录工具 bench.py
 def test_bench():
     print("试验记录工具 bench.py（仿真设备 + 假的键盘输入）")
@@ -1128,8 +1244,8 @@ if __name__ == "__main__":
     quick = len(sys.argv) > 1 and sys.argv[1] == "quick"
     real_serial = devices.serial
     for t in (test_arm, test_k230, test_lift, test_chassis, test_chassis_fw, test_calib_override,
-              test_step_and_guard, test_geometry, test_ghost, test_sim_factors, test_bench,
-              test_accuracy):
+              test_step_and_guard, test_geometry, test_ghost, test_ghost_fingerprint, test_sim_factors,
+              test_bench, test_accuracy):
         try:
             t()
         except Exception as e:

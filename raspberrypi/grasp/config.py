@@ -207,6 +207,15 @@ REACH_MID_D = None
 GOAL_MID = None
 # 对准时动了执行器、读数却几乎不变（< 30% 预期），连续 2 次 → 判定 K230 识别到的是机械臂自己，停止
 GHOST_CHECK = True
+# ghost 指纹（任务 10）：GHOST_CHECK 判定 ghost 时，把当时的读数（x_deg、y、d）记到 logs/ghosts.json；
+# 之后测到和某个指纹很接近的读数（各轴都在 GHOST_FP_TOL 内）就当作没看到，并提示"看到的是之前记录的假目标"。
+# 爪子相对相机不动，所以它的读数和机械臂姿态无关，记一次以后都认得出。
+# 注意：真物块恰好在指纹位置时也会被当成没看到 —— 误记了就删掉 logs/ghosts.json（或里面那一项）
+GHOST_FINGERPRINT = False
+GHOST_FP_FILE = "ghosts.json"
+GHOST_FP_TOL = {"x_deg": 1.5, "y": 6.0, "d": 15.0}
+GHOST_FP_MIN_HITS = 1     # 同一个指纹被判定 ghost 几次后才开始过滤（1 = 记一次就生效）
+GHOST_FP_MAX = 10         # 最多保留几个指纹（满了丢掉最久没命中的）
 # 升降轴到最低/最高点后，剩余高度误差（K230 读数 mm）不超过这个值就照样去抓（爪子张开时上下能兜住一点）
 LIFT_LIMIT_SLACK_MM = 15.0
 # 左右微调（度，底座右转为正）：对准后爪子落点系统性偏右就填负数，往左补。用 `calib.py trim <偏右毫米>` 设置
@@ -276,6 +285,7 @@ CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "BASE_LIMIT_BACKUP_MM",
     "BASE_BACKLASH_DEG", "BASE_APPROACH_DIR", "BASE_MIN_STEP_DEG", "GRASP_PROBE_MM", "GRASP_PROBE_FIRST",
     "TRIM_LEARN", "TRIM_LEARN_RATE", "TRIM_MAX_DEG", "TRIM_LEARN_EDGES", "REACH_MID_D", "GOAL_MID",
+    "GHOST_FINGERPRINT", "GHOST_FP_TOL", "GHOST_FP_MIN_HITS", "GHOST_FP_MAX",
 }
 
 
