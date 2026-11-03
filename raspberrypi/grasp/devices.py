@@ -25,6 +25,10 @@ class ManualOverride(DeviceError):
     """手柄接管：不是故障，等手柄断开后继续"""
 
 
+class DeviceResetError(DeviceError):
+    """下位机复位了（升降轴发了 READY）：它记的位置可能不对，不能自动接着动"""
+
+
 class RealClock:
     def now(self):
         return time.monotonic()
@@ -185,7 +189,7 @@ class _LineDevice:
             if not line:
                 continue
             if line.startswith("READY"):
-                raise DeviceError(f"{self.name} 复位了：{line}")
+                raise DeviceResetError(f"{self.name} 复位了：{line}")
             return line
         raise DeviceError(f"{self.name} 回复超时")
 

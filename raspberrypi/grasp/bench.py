@@ -150,13 +150,17 @@ class RealRig:
         return True
 
     def run_once(self, p=None):
-        from devices import DeviceError, ManualOverride
+        from devices import DeviceError, DeviceResetError, ManualOverride
         t0 = self.clock.now()
         try:
             if self.devs is None:                      # 上一次设备出错关掉了：重开
                 self.devs = self.main.open_devices(self.clock)
                 self.task = self.main.attach_task(self.task, self.devs, self.clock, self.step, self.guard)
             return self.task.run_once()
+        except DeviceResetError:                       # 升降轴复位：不能接着测（位置可能不对），退出
+            self.main.close_devices(self.devs or [])
+            self.devs = None
+            raise
         except DeviceError as e:                       # 含手柄接管（ManualOverride）
             kind = "manual" if isinstance(e, ManualOverride) else "device_error"
             print(("手柄接管：" if kind == "manual" else "设备错误：") + str(e))
@@ -658,12 +662,16 @@ def main(argv=None):
         print("启动：", " ".join(sys.argv), " calib.json 覆盖：", sorted(cfg.CALIB_LOADED))
         rig = RealRig(a.step, a.force)
         path = a.csv
+    from devices import DeviceResetError
     try:
         if not rig.open():
             return
         run_bench(rig, positions, a.repeat, a.resume, input, path)
     except KeyboardInterrupt:
         print("\n退出。")
+    except DeviceResetError as e:
+        print("设备复位：", e)
+        print(grasp_main.RESET_HINT)
     finally:
         rig.close()
     if a.sim:

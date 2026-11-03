@@ -23,12 +23,16 @@ import sys
 import time
 
 import config as cfg
-from devices import (Arm, DeviceError, K230, Lift, ManualGuard, ManualOverride, NullChassis,
+from devices import (Arm, DeviceError, DeviceResetError, K230, Lift, ManualGuard, ManualOverride, NullChassis,
                      RealClock, WheeltecChassis)
 from task import GraspTask
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, cfg.LOG_DIR)
+# 升降轴复位（READY）后不能自动接着跑：断电重启（RST POR）的固件认为自己在 0cm，滑台实际可能在半空，
+# 再发 "A 44" 会往上多走、撞到顶（任务 17 审查）
+RESET_HINT = ("  升降轴复位后它记的位置可能不对（断电重启时认为自己在 0cm），自动接着动可能让滑台撞到顶 / 底。\n"
+              "  请确认滑台位置：降到最下端后重新给升降轴上电（或在最下端发 Z），再重新运行。程序停止")
 
 
 # ============================================================ 仿真
@@ -338,6 +342,10 @@ def run_real(once, step, force, record=False):
             except ManualOverride as e:
                 print(e)
                 continue
+            except DeviceResetError as e:
+                print("设备复位：", e)
+                print(RESET_HINT)
+                return
             except DeviceError as e:
                 print("设备错误：", e)
                 close_devices(devs)
