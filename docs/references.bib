@@ -1,0 +1,622 @@
+% references.bib —— 论文参考文献（任务 15，2026-11-03）
+% 只收录 docs/论文文献调研.md 中标为"✅ 检索核实"的条目。
+% 核实方式：网络检索到原文所在页面（arXiv / 出版社 / 会议论文集 / 官方项目页），
+% 标题、作者、年份、出处一致；未读全文（本次云端会话无法直接打开 arxiv.org）。
+% 作者表只写检索中确认到的作者，其余用 "and others"；定稿前请用 arXiv/出版社页面导出的官方 BibTeX 替换。
+% 标为 ⚠️ / ❌ 的文献（Bongard 2006、Kwiatkowski 2019、Gold 2009、Hoffmann 2010、Hosoda 1994、
+% Nordin 2002、Wang 2024 迟滞、Park 2024 RA-L 等）没有放进来，见调研文档第 2 节。
+
+% ===================== 1 VLA 与模仿学习 =====================
+
+@misc{brohan2022rt1,
+  title         = {{RT-1}: Robotics Transformer for Real-World Control at Scale},
+  author        = {Brohan, Anthony and others},
+  year          = {2022},
+  eprint        = {2212.06817},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.RO},
+  note          = {作者表未逐一核对}
+}
+
+@inproceedings{rt2_2023,
+  title     = {{RT-2}: Vision-Language-Action Models Transfer Web Knowledge to Robotic Control},
+  author    = {Brohan, Anthony and others},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {229},
+  pages     = {2165--2183},
+  year      = {2023},
+  eprint    = {2307.15818},
+  archivePrefix = {arXiv},
+  note      = {PMLR 版本作者排序以 Zitkovich 为首，arXiv 版以 Brohan 为首；定稿时按所引版本统一}
+}
+
+@inproceedings{kim2024openvla,
+  title     = {{OpenVLA}: An Open-Source Vision-Language-Action Model},
+  author    = {Kim, Moo Jin and Pertsch, Karl and Karamcheti, Siddharth and Xiao, Ted and Balakrishna, Ashwin and Nair, Suraj and Rafailov, Rafael and Foster, Ethan and Lam, Grace and Sanketi, Pannag and Vuong, Quan and Kollar, Thomas and Burchfiel, Benjamin and Tedrake, Russ and Sadigh, Dorsa and Levine, Sergey and Liang, Percy and Finn, Chelsea},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  year      = {2024},
+  eprint    = {2406.09246},
+  archivePrefix = {arXiv}
+}
+
+@misc{black2024pi0,
+  title         = {$\pi_0$: A Vision-Language-Action Flow Model for General Robot Control},
+  author        = {Black, Kevin and others},
+  year          = {2024},
+  eprint        = {2410.24164},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  note          = {作者表未逐一核对}
+}
+
+@inproceedings{octo2024,
+  title     = {Octo: An Open-Source Generalist Robot Policy},
+  author    = {{Octo Model Team} and Ghosh, Dibya and Walke, Homer and Pertsch, Karl and Black, Kevin and Mees, Oier and others},
+  booktitle = {Robotics: Science and Systems (RSS)},
+  year      = {2024},
+  eprint    = {2405.12213},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{zhao2023act,
+  title     = {Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware},
+  author    = {Zhao, Tony Z. and others},
+  booktitle = {Robotics: Science and Systems (RSS)},
+  year      = {2023},
+  eprint    = {2304.13705},
+  archivePrefix = {arXiv},
+  note      = {作者表未逐一核对}
+}
+
+@inproceedings{chi2023diffusion,
+  title     = {Diffusion Policy: Visuomotor Policy Learning via Action Diffusion},
+  author    = {Chi, Cheng and Feng, Siyuan and Du, Yilun and Xu, Zhenjia and Cousineau, Eric and Burchfiel, Benjamin and Song, Shuran},
+  booktitle = {Robotics: Science and Systems (RSS)},
+  year      = {2023},
+  eprint    = {2303.04137},
+  archivePrefix = {arXiv},
+  note      = {IJRR 2024 期刊版作者表含 Tedrake，作者顺序不同；按所引版本调整}
+}
+
+@misc{zhao2025statefree,
+  title         = {Do You Need Proprioceptive States in Visuomotor Policies?},
+  author        = {Zhao, Juntu and Lu, Wenbo and Zhang, Di and Liu, Yufeng and Liang, Yushen and Zhang, Tianluo and Cao, Yifeng and Xie, Junyuan and Hu, Yingdong and Wang, Shengjie and Guo, Junliang and Wang, Dequan and Gao, Yang},
+  year          = {2025},
+  eprint        = {2509.18644},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.RO}
+}
+
+@inproceedings{wen2020copycat,
+  title     = {Fighting Copycat Agents in Behavioral Cloning from Observation Histories},
+  author    = {Wen, Chuan and Lin, Jierui and Darrell, Trevor and Jayaraman, Dinesh and Gao, Yang},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2020},
+  eprint    = {2010.14876},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{oxe2024,
+  title     = {Open {X-Embodiment}: Robotic Learning Datasets and {RT-X} Models},
+  author    = {{Open X-Embodiment Collaboration}},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year      = {2024},
+  eprint    = {2310.08864},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{khazatsky2024droid,
+  title     = {{DROID}: A Large-Scale In-The-Wild Robot Manipulation Dataset},
+  author    = {Khazatsky, Alexander and Pertsch, Karl and others},
+  booktitle = {Robotics: Science and Systems (RSS)},
+  year      = {2024},
+  eprint    = {2403.12945},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{fu2024mobilealoha,
+  title     = {Mobile {ALOHA}: Learning Bimanual Mobile Manipulation with Low-Cost Whole-Body Teleoperation},
+  author    = {Fu, Zipeng and Zhao, Tony Z. and Finn, Chelsea},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {270},
+  pages     = {4066--4083},
+  year      = {2024},
+  eprint    = {2401.02117},
+  archivePrefix = {arXiv}
+}
+
+% ===================== 2 世界模型 =====================
+
+@inproceedings{hafner2019planet,
+  title     = {Learning Latent Dynamics for Planning from Pixels},
+  author    = {Hafner, Danijar and others},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2019},
+  eprint    = {1811.04551},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{hafner2020dreamer,
+  title     = {Dream to Control: Learning Behaviors by Latent Imagination},
+  author    = {Hafner, Danijar and Lillicrap, Timothy and Ba, Jimmy and Norouzi, Mohammad},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2020},
+  eprint    = {1912.01603},
+  archivePrefix = {arXiv}
+}
+
+@article{hafner2025dreamerv3,
+  title   = {Mastering diverse control tasks through world models},
+  author  = {Hafner, Danijar and Pasukonis, Jurgis and Ba, Jimmy and Lillicrap, Timothy},
+  journal = {Nature},
+  year    = {2025},
+  doi     = {10.1038/s41586-025-08744-2},
+  note    = {arXiv:2301.04104，预印本题为 Mastering Diverse Domains through World Models}
+}
+
+@inproceedings{wu2022daydreamer,
+  title     = {{DayDreamer}: World Models for Physical Robot Learning},
+  author    = {Wu, Philipp and Escontrela, Alejandro and Hafner, Danijar and Abbeel, Pieter and Goldberg, Ken},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {205},
+  pages     = {2226--2240},
+  year      = {2022},
+  eprint    = {2206.14176},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{hansen2022tdmpc,
+  title     = {Temporal Difference Learning for Model Predictive Control},
+  author    = {Hansen, Nicklas and Wang, Xiaolong and Su, Hao},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {162},
+  pages     = {8387--8406},
+  year      = {2022},
+  eprint    = {2203.04955},
+  archivePrefix = {arXiv},
+  note      = {PMLR 版作者顺序为 Hansen, Su, Wang}
+}
+
+@inproceedings{hansen2024tdmpc2,
+  title     = {{TD-MPC2}: Scalable, Robust World Models for Continuous Control},
+  author    = {Hansen, Nicklas and Su, Hao and Wang, Xiaolong},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024},
+  eprint    = {2310.16828},
+  archivePrefix = {arXiv}
+}
+
+@misc{finn2017foresight,
+  title         = {Deep Visual Foresight for Planning Robot Motion},
+  author        = {Finn, Chelsea and Levine, Sergey},
+  year          = {2016},
+  eprint        = {1610.00696},
+  archivePrefix = {arXiv},
+  note          = {ICRA 2017 版本出处未从原页核实}
+}
+
+@misc{ebert2018foresight,
+  title         = {Visual Foresight: Model-Based Deep Reinforcement Learning for Vision-Based Robotic Control},
+  author        = {Ebert, Frederik and Finn, Chelsea and Dasari, Sudeep and Xie, Annie and Lee, Alex and Levine, Sergey},
+  year          = {2018},
+  eprint        = {1812.00568},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.RO}
+}
+
+@inproceedings{yang2024unisim,
+  title     = {Learning Interactive Real-World Simulators},
+  author    = {Yang, Mengjiao and Du, Yilun and Ghasemipour, Kamyar and Tompson, Jonathan and Schuurmans, Dale and Abbeel, Pieter},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024},
+  eprint    = {2310.06114},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{zhou2025dinowm,
+  title     = {{DINO-WM}: World Models on Pre-trained Visual Features enable Zero-shot Planning},
+  author    = {Zhou, Gaoyue and Pan, Hengkai and LeCun, Yann and Pinto, Lerrel},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {267},
+  year      = {2025},
+  eprint    = {2411.04983},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{pan2022isodream,
+  title     = {{Iso-Dream}: Isolating and Leveraging Noncontrollable Visual Dynamics in World Models},
+  author    = {Pan, Minting and Zhu, Xiangming and Wang, Yunbo and Yang, Xiaokang},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2022},
+  eprint    = {2205.13817},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{wang2022denoised,
+  title     = {Denoised {MDPs}: Learning World Models Better Than the World Itself},
+  author    = {Wang, Tongzhou and Du, Simon S. and Torralba, Antonio and Isola, Phillip and Zhang, Amy and Tian, Yuandong},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {162},
+  pages     = {22591--22612},
+  year      = {2022}
+}
+
+@inproceedings{islam2023acro,
+  title     = {Principled Offline {RL} in the Presence of Rich Exogenous Information},
+  author    = {Islam, Riashat and Tomar, Manan and Lamb, Alex and others},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {202},
+  pages     = {14390--14421},
+  year      = {2023},
+  eprint    = {2211.00164},
+  archivePrefix = {arXiv},
+  note      = {arXiv 题为 Agent-Controller Representations: Principled Offline RL with Rich Exogenous Information}
+}
+
+@inproceedings{shaj2020acrkn,
+  title     = {Action-Conditional Recurrent {Kalman} Networks For Forward and Inverse Dynamics Learning},
+  author    = {Shaj, Vaisakh and others},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {155},
+  year      = {2020},
+  eprint    = {2010.10201},
+  archivePrefix = {arXiv}
+}
+
+% ===================== 3 自我建模 / 自我识别 =====================
+
+@article{chen2022fullbody,
+  title   = {Full-Body Visual Self-Modeling of Robot Morphologies},
+  author  = {Chen, Boyuan and Kwiatkowski, Robert and Vondrick, Carl and Lipson, Hod},
+  journal = {Science Robotics},
+  year    = {2022},
+  doi     = {10.1126/scirobotics.abn1944},
+  note    = {arXiv:2111.06389}
+}
+
+@article{hu2025simulations,
+  title   = {Teaching Robots to Build Simulations of Themselves},
+  author  = {Hu, Yuhang and Lin, Jiong and Lipson, Hod},
+  journal = {Nature Machine Intelligence},
+  year    = {2025},
+  note    = {arXiv:2311.12151}
+}
+
+@misc{hu2025egocentric,
+  title         = {Egocentric Visual Self-Modeling for Autonomous Robot Dynamics Prediction and Adaptation},
+  author        = {Hu, Yuhang and Chen, Boyuan and Lipson, Hod},
+  year          = {2022},
+  eprint        = {2207.03386},
+  archivePrefix = {arXiv},
+  note          = {期刊版 npj Robotics 3:14 (2025), doi:10.1038/s44182-025-00031-6 只从第三方 PDF 看到，未核实}
+}
+
+@article{li2025jacobianfields,
+  title   = {Controlling diverse robots by inferring {Jacobian} fields with deep networks},
+  author  = {Li, Sizhe Lester and Zhang, Annan and Chen, Boyuan and Matusik, Hanna and Liu, Chao and Rus, Daniela and Sitzmann, Vincent},
+  journal = {Nature},
+  volume  = {643},
+  year    = {2025},
+  doi     = {10.1038/s41586-025-09170-0},
+  note    = {arXiv:2407.08722}
+}
+
+@misc{toshimitsu2025dije,
+  title         = {{DIJE}: Dense Image {Jacobian} Estimation for Robust Robotic Self-Recognition and Visual Servoing},
+  author        = {Toshimitsu, Yasunori and Kawaharazuka, Kento and Miki, Akihiro and Okada, Kei and Inaba, Masayuki},
+  year          = {2025},
+  eprint        = {2507.00446},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{lanillos2018predictive,
+  title     = {Adaptive Robot Body Learning and Estimation Through Predictive Coding},
+  author    = {Lanillos, Pablo and Cheng, Gordon},
+  booktitle = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  pages     = {4083--4090},
+  year      = {2018},
+  doi       = {10.1109/IROS.2018.8593684},
+  eprint    = {1805.03104},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{labbe2021robopose,
+  title     = {Single-view robot pose and joint angle estimation via render \& compare},
+  author    = {Labb{\'e}, Yann and Carpentier, Justin and Aubry, Mathieu and Sivic, Josef},
+  booktitle = {IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2021},
+  eprint    = {2104.09359},
+  archivePrefix = {arXiv}
+}
+
+@misc{rezvani2025embodiment,
+  title         = {Robust Visual Embodiment: How Robots Discover Their Bodies in Real Environments},
+  author        = {Rezvani, Salim and Mahmood, Ammar Jaleel and Chhabra, Robin},
+  year          = {2025},
+  eprint        = {2510.03677},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.RO}
+}
+
+@misc{almeida2021whereismyhand,
+  title         = {Where is my hand? {Deep} hand segmentation for visual self-recognition in humanoid robots},
+  author        = {Almeida, Alexandre and Vicente, Pedro and Bernardino, Alexandre},
+  year          = {2021},
+  eprint        = {2102.04750},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.RO}
+}
+
+@inproceedings{boerdijk2020gripperseg,
+  title     = {Self-Supervised Object-in-Gripper Segmentation from Robotic Motions},
+  author    = {Boerdijk, Wout and Sundermeyer, Martin and Durner, Maximilian and Triebel, Rudolph},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {155},
+  pages     = {1231--1245},
+  year      = {2020},
+  eprint    = {2002.04487},
+  archivePrefix = {arXiv}
+}
+
+% ===================== 4 物体中心表示 =====================
+
+@inproceedings{locatello2020slot,
+  title     = {Object-Centric Learning with Slot Attention},
+  author    = {Locatello, Francesco and Weissenborn, Dirk and Unterthiner, Thomas and Mahendran, Aravindh and Heigold, Georg and Uszkoreit, Jakob and Dosovitskiy, Alexey and Kipf, Thomas},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  volume    = {33},
+  pages     = {11525--11538},
+  year      = {2020},
+  eprint    = {2006.15055},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{kipf2022savi,
+  title     = {Conditional Object-Centric Learning from Video},
+  author    = {Kipf, Thomas and others},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2022},
+  eprint    = {2111.12594},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{kipf2020cswm,
+  title     = {Contrastive Learning of Structured World Models},
+  author    = {Kipf, Thomas and van der Pol, Elise and Welling, Max},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2020},
+  eprint    = {1911.12247},
+  archivePrefix = {arXiv}
+}
+
+@article{ferraro2023focus,
+  title   = {{FOCUS}: object-centric world models for robotic manipulation},
+  author  = {Ferraro, Stefano and Mazzaglia, Pietro and Verbelen, Tim and Dhoedt, Bart},
+  journal = {Frontiers in Neurorobotics},
+  year    = {2025},
+  doi     = {10.3389/fnbot.2025.1585386},
+  note    = {arXiv:2307.02427；NeurIPS 2023 IMOL 研讨会版本}
+}
+
+@inproceedings{mosbach2025sold,
+  title     = {{SOLD}: Slot Object-Centric Latent Dynamics Models for Relational Manipulation Learning from Pixels},
+  author    = {Mosbach, Malte and Ewertz, Jan Niklas and Villar-Corrales, Angel and Behnke, Sven},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {267},
+  pages     = {44911--44935},
+  year      = {2025},
+  eprint    = {2410.08822},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{chapin2025objectcentric,
+  title     = {Is an object-centric representation beneficial for robotic manipulation?},
+  author    = {Chapin, Alexandre and Dellandrea, Emmanuel and Chen, Liming},
+  booktitle = {ROBOVIS 2025},
+  year      = {2025},
+  eprint    = {2506.19408},
+  archivePrefix = {arXiv}
+}
+
+@misc{liu2026oawam,
+  title         = {{OA-WAM}: Object-Addressable World Action Model for Robust Robot Manipulation},
+  author        = {Liu, Yushan and Ding, Wenbo and others},
+  year          = {2026},
+  eprint        = {2605.06481},
+  archivePrefix = {arXiv}
+}
+
+% ===================== 5 交互式感知 / 自监督 =====================
+
+@article{bohg2017interactive,
+  title   = {Interactive Perception: Leveraging Action in Perception and Perception in Action},
+  author  = {Bohg, Jeannette and Hausman, Karol and Sankaran, Bharath and Brock, Oliver and Kragic, Danica and Schaal, Stefan and Sukhatme, Gaurav S.},
+  journal = {IEEE Transactions on Robotics},
+  volume  = {33},
+  pages   = {1273--1291},
+  year    = {2017},
+  doi     = {10.1109/TRO.2017.2721939}
+}
+
+@misc{agrawal2016poke,
+  title         = {Learning to Poke by Poking: Experiential Learning of Intuitive Physics},
+  author        = {Agrawal, Pulkit and Nair, Ashvin and Abbeel, Pieter and Malik, Jitendra and Levine, Sergey},
+  year          = {2016},
+  eprint        = {1606.07419},
+  archivePrefix = {arXiv},
+  note          = {NeurIPS 2016 版本出处未从原页核实}
+}
+
+@inproceedings{pinto2016supersizing,
+  title     = {Supersizing Self-supervision: Learning to Grasp from 50K Tries and 700 Robot Hours},
+  author    = {Pinto, Lerrel and Gupta, Abhinav},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  pages     = {3406--3413},
+  year      = {2016},
+  eprint    = {1509.06825},
+  archivePrefix = {arXiv}
+}
+
+@misc{levine2016handeye,
+  title         = {Learning Hand-Eye Coordination for Robotic Grasping with Deep Learning and Large-Scale Data Collection},
+  author        = {Levine, Sergey and others},
+  year          = {2016},
+  eprint        = {1603.02199},
+  archivePrefix = {arXiv},
+  note          = {ISER 2016 论文的扩展版；IJRR 版本未核实}
+}
+
+@inproceedings{pathak2018segbyinteraction,
+  title     = {Learning Instance Segmentation by Interaction},
+  author    = {Pathak, Deepak and Shentu, Yide and Chen, Dian and Agrawal, Pulkit and Darrell, Trevor and Levine, Sergey and Malik, Jitendra},
+  booktitle = {IEEE/CVF Conference on Computer Vision and Pattern Recognition Workshops (CVPRW)},
+  pages     = {2042--2045},
+  year      = {2018},
+  doi       = {10.1109/CVPRW.2018.00276}
+}
+
+@inproceedings{pathak2017curiosity,
+  title     = {Curiosity-driven Exploration by Self-supervised Prediction},
+  author    = {Pathak, Deepak and Agrawal, Pulkit and Efros, Alexei A. and Darrell, Trevor},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {70},
+  pages     = {2778--2787},
+  year      = {2017},
+  eprint    = {1705.05363},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{gupta2018homes,
+  title     = {Robot Learning in Homes: Improving Generalization and Reducing Dataset Bias},
+  author    = {Gupta, Abhinav and Murali, Adithyavairavan and Gandhi, Dhiraj and Pinto, Lerrel},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  pages     = {9112--9122},
+  year      = {2018},
+  eprint    = {1807.07049},
+  archivePrefix = {arXiv}
+}
+
+% ===================== 6 视觉伺服 / 回差 / 执行器 =====================
+
+@inproceedings{jagersand1997uncalibrated,
+  title     = {Experimental Evaluation of Uncalibrated Visual Servoing for Precision Manipulation},
+  author    = {J{\"a}gersand, Martin and Fuentes, Olac and Nelson, Randal},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  volume    = {4},
+  pages     = {2874--2880},
+  year      = {1997},
+  doi       = {10.1109/ROBOT.1997.606723}
+}
+
+@article{piepmeier2004uncalibrated,
+  title   = {Uncalibrated Dynamic Visual Servoing},
+  author  = {Piepmeier, Jenelle Armstrong and McMurray, Gary V. and Lipkin, Harvey},
+  journal = {IEEE Transactions on Robotics and Automation},
+  volume  = {20},
+  number  = {1},
+  pages   = {143--147},
+  year    = {2004}
+}
+
+@article{chaumette2006visual,
+  title   = {Visual Servo Control, Part {I}: Basic Approaches},
+  author  = {Chaumette, Fran{\c{c}}ois and Hutchinson, Seth},
+  journal = {IEEE Robotics \& Automation Magazine},
+  volume  = {13},
+  number  = {4},
+  pages   = {82--90},
+  year    = {2006}
+}
+
+@book{tao1996adaptive,
+  title     = {Adaptive Control of Systems with Actuator and Sensor Nonlinearities},
+  author    = {Tao, Gang and Kokotovi{\'c}, Petar V.},
+  publisher = {Wiley},
+  address   = {New York},
+  year      = {1996},
+  isbn      = {978-0-471-15654-3}
+}
+
+@article{hwangbo2019anymal,
+  title   = {Learning agile and dynamic motor skills for legged robots},
+  author  = {Hwangbo, Jemin and Lee, Joonho and Dosovitskiy, Alexey and Bellicoso, Dario and Tsounis, Vassilios and Koltun, Vladlen and Hutter, Marco},
+  journal = {Science Robotics},
+  volume  = {4},
+  number  = {26},
+  pages   = {eaau5872},
+  year    = {2019},
+  doi     = {10.1126/scirobotics.aau5872}
+}
+
+% ===================== 7 低成本 / 无本体感知 =====================
+
+@inproceedings{cadene2026lerobot,
+  title     = {{LeRobot}: An Open-Source Library for End-to-End Robot Learning},
+  author    = {Cadene, Remi and others},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2026},
+  eprint    = {2602.22818},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{zuo2019craves,
+  title     = {{CRAVES}: Controlling Robotic Arm with a Vision-based Economic System},
+  author    = {Zuo, Yiming and Qiu, Weichao and Xie, Lingxi and Zhong, Fangwei and Wang, Yizhou and Yuille, Alan L.},
+  booktitle = {IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2019},
+  doi       = {10.1109/CVPR.2019.00434},
+  eprint    = {1812.00725},
+  archivePrefix = {arXiv}
+}
+
+@misc{sheikholeslami2025visualproprio,
+  title         = {Latent Representations for Visual Proprioception in Inexpensive Robots},
+  author        = {Sheikholeslami, Sahara and B{\"o}l{\"o}ni, Ladislau},
+  year          = {2025},
+  eprint        = {2504.14634},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.RO}
+}
+
+@misc{smith2026fiducial,
+  title         = {Fiducial Exoskeletons: Image-Centric Robot State Estimation},
+  author        = {Smith, Cameron and Van Hoorick, Basile and Guizilini, Vitor and Wang, Yue},
+  year          = {2026},
+  eprint        = {2601.08034},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.RO}
+}
+
+@article{wang2020softproprio,
+  title   = {Real-time Soft Body {3D} Proprioception via Deep Vision-based Sensing},
+  author  = {Wang, Ruoyu and Wang, Shiheng and Du, Songyu and Xiao, Erdong and Yuan, Wenzhen and Feng, Chen},
+  journal = {IEEE Robotics and Automation Letters},
+  volume  = {5},
+  number  = {2},
+  pages   = {3382--3389},
+  year    = {2020},
+  eprint  = {1904.03820},
+  archivePrefix = {arXiv}
+}
+
+% ===================== 8 眼在手上 =====================
+
+@inproceedings{hsu2022seehands,
+  title     = {Vision-Based Manipulators Need to Also See from Their Hands},
+  author    = {Hsu, Kyle and Kim, Moo Jin and Rafailov, Rafael and Wu, Jiajun and Finn, Chelsea},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2022},
+  eprint    = {2203.12677},
+  archivePrefix = {arXiv}
+}
