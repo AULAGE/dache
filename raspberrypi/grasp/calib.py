@@ -14,7 +14,7 @@
   python3 calib.py lift 15             升降轴走到 15cm
   python3 calib.py jog observe         键盘点动微调某个姿态，调好按 s 保存
   python3 calib.py auto                半自动：测升降轴方向/灵敏度、底座方向、相机半径（需要物块在画面里）
-  python3 calib.py teach               引导式标定抓取位置：GOAL、REACH_NEAR_D（倒推法）
+  python3 calib.py teach [near|far]    引导式标定抓取位置（倒推法）：不写 = 近远都标；near / far = 只标一个
   python3 calib.py done                全部标定完：把 POSES_CALIBRATED 设为 true
   python3 calib.py trim 6              左右微调：爪子落点偏右 6mm（偏左写负数，可累加；trim reset 清零）
   python3 calib.py shake [姿态]        摆到某个姿态（不写 = 原地不动）静止 6 秒，用 K230 读数量机械臂抖多厉害
@@ -166,7 +166,7 @@ def goal(cam=None, offer_save=True):
     return m
 
 
-def jog(name):
+def jog(name, cam=None):
     """键盘点动：<id> <+/-步长>、<id> =<脉宽>、o/c 张合爪、b <+/-度> 转底座、s 保存、q 退出"""
     if name not in cfg.POSES:
         sys.exit(f"没有这个姿态：{name}，可选 {list(cfg.POSES)}")
@@ -174,11 +174,12 @@ def jog(name):
     if name == "drop" and cfg.BASE_ID in cfg.POSES["drop"]:
         cur[cfg.BASE_ID] = cfg.POSES["drop"][cfg.BASE_ID]
     arm_move(cur, 1500)
-    try:
-        cam = open_cam()                   # 每动一下显示一次 K230 读数，边调边看
-    except Exception as e:
-        cam = None
-        print("（K230 打不开，不显示读数：", e, "）")
+    if cam is None:                        # 每动一下显示一次 K230 读数，边调边看（teach 里调用时复用它的连接）
+        try:
+            cam = open_cam()
+        except Exception as e:
+            cam = None
+            print("（K230 打不开，不显示读数：", e, "）")
     print("点动命令：'4 +20' 4 号舵机 +20us；'5 =1900' 直接设；'b +10' 底座转 10°；"
           "'o' 张爪；'c' 合爪；'s' 保存；'q' 退出；直接回车 = 只看读数")
     while True:
@@ -287,11 +288,30 @@ def auto():
         save_calib(result)
 
 
-def teach():
-    """倒推法标定抓取位置：先把物块放进爪子，再退回观察姿态看相机读数"""
+def teach(only=None):
+    """
+    倒推法标定抓取位置：先把物块放进爪子，再退回观察姿态看相机读数
+      calib.py teach        近、远都标
+      calib.py teach near   只标近处（reach_near + GOAL）
+      calib.py teach far    只标远处（reach_far + GOAL_FAR）
+    """
     cam = open_cam()
-    for which in ("reach_near", "reach_far"):
-        if which == "reach_far" and ask("要不要再标定一个更远的抓取姿态 reach_far（用于插值）？[y/N] ") != "y":
+    # 标定时升降轴的高度决定了以后能抓的高度范围：太靠两端，物块再高/再低一点就够不着了
+    try:
+        lift = Lift(cfg.PORTS["lift"], cfg.BAUD["lift"], cfg.LIFT_MAX_CM)
+        h = lift.position()
+        lift.ser.close()
+        print(f"升降轴现在 {h:.1f}cm（行程 0~{cfg.LIFT_MAX_CM:.0f}cm）")
+        if h < 4 or h > cfg.LIFT_MAX_CM - 6:
+            print(f"⚠ 升降轴太靠{'下' if h < 4 else '上'}了：以后比这次{'更低' if h < 4 else '更高'}的物块会够不着。"
+                  f"建议物块放在要抓的最低平面（例如地面），升降轴放 5~10cm 再标（calib.py lift 8）")
+            if ask("还是要在这个高度标吗？[y/N] ") != "y":
+                return
+    except Exception as e:
+        print("（读不到升降轴高度，跳过检查：", e, "）")
+    order = {"near": ("reach_near",), "far": ("reach_far",)}.get(only, ("reach_near", "reach_far"))
+    for which in order:
+        if only is None and which == "reach_far" and                 ask("要不要再标定一个更远的抓取姿态 reach_far（用于插值）？[y/N] ") != "y":
             near = load_calib().get("REACH_NEAR_D", cfg.REACH_NEAR_D)
             save_calib({"POSES": {"reach_far": cfg.POSES["reach_near"]}, "REACH_FAR_D": near + 70})
             print("reach_far 设成和 reach_near 一样（不插值）")
@@ -304,7 +324,7 @@ def teach():
             if a == "q":
                 return
             if a == "j":
-                jog(which)
+                jog(which, cam)
                 arm_move({**pose_pulses(which), cfg.CLAW_ID: cfg.CLAW_OPEN}, 800)
                 continue
             arm_move({cfg.CLAW_ID: cfg.CLAW_CLOSE}, 600)
@@ -412,7 +432,7 @@ def main(argv):
     elif cmd == "auto":
         auto()
     elif cmd == "teach":
-        teach()
+        teach(args[0] if args else None)
     elif cmd == "done":
         save_calib({"POSES_CALIBRATED": True})
     elif cmd == "trim":
