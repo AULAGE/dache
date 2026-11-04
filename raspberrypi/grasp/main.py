@@ -136,6 +136,7 @@ def open_devices(clock):
         cam = K230(cfg.PORTS["k230"], cfg.BAUD["k230"], clock, cfg.TARGET_TIMEOUT_S, cfg.K230_ROTATE)
         opened.append(cam)
         lift = Lift(cfg.PORTS["lift"], cfg.BAUD["lift"], cfg.LIFT_MAX_CM)
+        lift.done_poll_s = cfg.LIFT_DONE_POLL_S
         opened.append(lift)
         arm = Arm(cfg.PORTS["arm"], cfg.BAUD["arm"], clock, robust=cfg.ARM_USB_ROBUST)
         opened.append(arm)

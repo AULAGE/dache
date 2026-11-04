@@ -137,6 +137,7 @@ PROFILE_DETAIL = False      # Profiler 额外统计颜色精修内部各步（ce
 IGNORE_REGIONS_ENABLE = True
 IGNORE_REGIONS = [
     (0.00, 0.40, 0.12, 0.60),   # 爪子脚：画面左侧中间（2026-11-03 在 IDE 里目测约 1/60 面积，区域取得略大，约 1/40）
+    (0.00, 0.20, 0.05, 0.33),   # 爪子张开（500）时脚缩到左边缘上方，只露一小条（2026-11-04 IDE 截图）；靠边的真物块本来就不发帧
 ]
 IGNORE_DRAW = True              # 在 OSD 上用红色虚线框画出忽略区域
 IGNORE_CALIB_MODE = False       # True：终端持续打印每个检测框的归一化中心和大小（不放物块时看爪子脚被识别成什么样）

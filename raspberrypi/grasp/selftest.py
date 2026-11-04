@@ -214,6 +214,27 @@ def test_lift():
         check("UNHOMED 报错", False)
     except devices.DeviceError as e:
         check("UNHOMED 报错", "UNHOMED" in str(e))
+    # 2026-11-04 真机：DONE 丢了 → LIFT_DONE_POLL_S 查 P，IDLE 就按到位
+    mcu3 = FakeLiftMCU()
+    install_fake(mcu3)
+    lift3 = devices.Lift("x", 115200, max_cm=44)
+    lift3.position()
+    orig_out = mcu3.out
+
+    class DropDone(list):
+        def append(self, x):
+            if not str(x).startswith("DONE"):
+                super().append(x)
+    mcu3.out = DropDone(orig_out)
+    lift3.done_poll_s = 0.05
+    t0 = time.monotonic()
+    check("丢了 DONE：查到 IDLE 按到位", lift3.move_to(12, timeout=3.0) == 12.0 and time.monotonic() - t0 < 1.0)
+    lift3.done_poll_s = 0.0
+    try:
+        lift3.move_to(15, timeout=0.3)
+        check("丢了 DONE、不查询（原行为）：超时报错", False)
+    except devices.DeviceError as e:
+        check("丢了 DONE、不查询（原行为）：超时报错", "超时" in str(e))
 
 
 # ------------------------------------------------------------ 底盘：带平滑减速的假控制器

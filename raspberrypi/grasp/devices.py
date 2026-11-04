@@ -223,6 +223,10 @@ class Lift(_LineDevice):
         super().__init__("升降轴", port, baud)
         self.max_cm = max_cm
         self.pos = None             # 最近一次已知位置（cm）
+        # config.LIFT_DONE_POLL_S（main.py 打开设备时设置）：>0 时等 DONE 超过这么久就发 P 查询，查到 IDLE 就按到位处理。
+        # 2026-11-04 真机：抓到物块后下降 5cm，电机已停但 30 秒没等到 DONE（单独测 A 5/A 0 正常），整次报 device_error。
+        # 0 = 原行为（只等 DONE）
+        self.done_poll_s = 0.0
 
     def position(self):
         parts = self.cmd("P").split()
@@ -248,8 +252,38 @@ class Lift(_LineDevice):
         self.cmd(f"A {self._target(base + cm):.2f}")
 
     def wait_move(self, timeout=30.0):
+        if self.done_poll_s > 0:
+            return self._wait_move_poll(timeout)
         self.pos = float(self.wait_done(timeout).split()[1])
         return self.pos
+
+    def _wait_move_poll(self, timeout):
+        """等 DONE；每 done_poll_s 秒没等到就发一次 P：回 IDLE = 已经停了（DONE 丢了），MOVING = 继续等"""
+        deadline = time.monotonic() + timeout
+        while True:
+            if time.monotonic() >= deadline:
+                raise DeviceError(f"{self.name} 回复超时")
+            try:
+                line = self._readline(min(deadline, time.monotonic() + self.done_poll_s))
+            except DeviceResetError:
+                raise
+            except DeviceError:
+                self.ser.write(b"P\n")          # 这一段没收到任何东西：查一下位置
+                continue
+            parts = line.split()
+            if line.startswith("DONE") and len(parts) >= 2:
+                self.pos = float(parts[1])
+                return self.pos
+            if line.startswith("POS") and len(parts) >= 3:
+                if parts[2] == "UNHOMED":
+                    raise DeviceError("升降轴位置未知（UNHOMED）：把它放到最下端后发 Z，或断电重启")
+                if parts[2] == "IDLE":
+                    print(f"  ⚠ {self.name} 没收到 DONE，查询到已停在 {parts[1]}cm，按到位处理")
+                    self.pos = float(parts[1])
+                    return self.pos
+                continue                        # MOVING：还在走
+            if not line.startswith(("OK", "DONE")):
+                print(f"  ⚠ {self.name} 等 DONE 时收到看不懂的回复：{line!r}")
 
     def stop(self):
         self.cmd("E")

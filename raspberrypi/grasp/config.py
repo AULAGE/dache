@@ -58,6 +58,8 @@ CHASSIS_YAW_TRIM_DEG_PER_M = 0.0  # [标定] 直走时车头每米自己右偏�
 
 # ======================= 安全 =======================
 LIFT_MAX_CM = 44.0         # 升降轴软件上限（旧脚本 ourcar.py / pad_drive3.py 都用 44；固件硬上限 50）
+# 升降轴等 DONE 超过这么久（秒）就发 P 查询，IDLE 就按到位处理（2026-11-04 真机丢过 DONE，见 devices.Lift）。0 = 原行为
+LIFT_DONE_POLL_S = 3.0
 BATTERY_MIN_V = 22.0       # 底盘电池低于这个电压不启动（实测满电约 25.8V）
 #   固件源码自己的低压保护是 10V（12V 小车用，balance.c:328），对 24V 车不起作用，所以这一项必须由树莓派把关
 
@@ -332,7 +334,7 @@ CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "ARM_SLOW_MS", "STEP_ALPHA",
     "CHASSIS_STOP_MODEL", "CHASSIS_CMD_LATENCY_S", "CHASSIS_PI_TAU_S", "CHASSIS_REF_VOLTAGE_V",
     "CHASSIS_CMD_TTL_S", "CHASSIS_YAW_TRIM_DEG_PER_M",
-    "ARM_USB_ROBUST", "SEARCH_CONFIRM", "CONFIRM_D_MM", "CONFIRM_D_FRAC", "CONFIRM_X_DEG",
+    "ARM_USB_ROBUST", "LIFT_DONE_POLL_S", "SEARCH_CONFIRM", "CONFIRM_D_MM", "CONFIRM_D_FRAC", "CONFIRM_X_DEG",
     "BASE_LIMIT_BACKUP_MM", "GHOST_CHECK_D", "SEARCH_CONFIRM_CHASSIS", "SEARCH_BACKOFF_MAX_MM",
     "CHASSIS_JUMP_CHECK", "CHASSIS_JUMP_D_MM", "SEARCH_BASE_DEG",
     "BASE_BACKLASH_DEG", "BASE_APPROACH_DIR", "BASE_MIN_STEP_DEG", "GRASP_PROBE_MM", "GRASP_PROBE_FIRST",
