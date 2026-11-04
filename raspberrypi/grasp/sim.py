@@ -31,6 +31,9 @@
                        SIM_GRIP_TOL_MM 横向抓取容差（mm，代替原来的 3°）
   9 SIM_REACH_SHIFT    伸出时机械臂重心外移，把底座推到回差间隙的一侧（每台车固定哪一侧）
   10 SIM_REACH_SAG_MM  两点关节插值在中间深度时爪子高度偏（抛物线，t=0.5 处最大）
+
+任务 13 新增（默认关；python3 sim_speed_verify.py 打开对比）：
+  11 SIM_CLAW_PUSH_P   合爪没夹住时，物块离爪子不太远就有概率被推开 10~40mm（独立随机数流）
 """
 import math
 import random
@@ -137,6 +140,7 @@ class World:
         self.picked = False
         self.removed = False
         self.pushes = 0              # 统计：物块被机械臂推开的次数
+        self.claw_pushes = 0         # 统计：其中合爪没夹住时推开的次数（任务 13）
         # 运动窗口：[开始, 结束, 开始前的真实视图 or None, 是否插值]
         self.clock = None
         self.motion = None
@@ -690,10 +694,11 @@ class SimArm:
     # 机械爪实际能抓住的范围（观察姿态下的测量值，比对准容差宽一些）
     GRIP_TOL = {"x_deg": 3.0, "y": 8.0, "d": 18.0}
 
-    def __init__(self, world, clock, cfg, rng, rng_u=None, rng_s=None):
+    def __init__(self, world, clock, cfg, rng, rng_u=None, rng_s=None, rng_c=None):
         self.w, self.clock, self.cfg, self.rng = world, clock, cfg, rng
         self.rng_u = rng_u or random.Random(1)      # USB 掉线
         self.rng_s = rng_s or random.Random(2)      # 推开物块
+        self.rng_c = rng_c or random.Random(3)      # 合爪没夹住时推开物块（任务 13）
         self.down_until = -1.0
         self.usb_gen = 0
         self.drops = 0
@@ -792,6 +797,27 @@ class SimArm:
         self.w.block[1] += dist * math.sin(phi)
         self.w.pushes += 1
 
+    def _maybe_claw_push(self):
+        """11 合爪没夹住：爪子合拢时碰到物块，有概率把它推开 10~40mm（往物块偏的那一侧、朝外）"""
+        c = self.cfg
+        p = _c(c, "SIM_CLAW_PUSH_P", 0.0)
+        if p <= 0 or self.w.held:
+            return
+        en, ex = self._misalign()
+        if en is None or en > _c(c, "SIM_CLAW_PUSH_MAX_EN", 3.0):
+            return
+        r = self.rng_c
+        if r.random() >= p:
+            return
+        a, b = _c(c, "SIM_CLAW_PUSH_MM", (10, 40))
+        dist = r.uniform(a, b)
+        _, _, _, h = self.w.camera("observe")
+        phi = h - math.copysign(r.uniform(0, math.radians(60)), ex if ex else r.uniform(-1, 1))
+        self.w.block[0] += dist * math.cos(phi)
+        self.w.block[1] += dist * math.sin(phi)
+        self.w.pushes += 1
+        self.w.claw_pushes += 1
+
     def apply(self, pulses, ms):
         """控制板收到一帧：舵机开始动（状态立即生效，相机在动作时间内的帧按插值 + 模糊）"""
         c, w = self.cfg, self.w
@@ -834,6 +860,8 @@ class SimArm:
                 w.held_view = w.true_view("reach", fov=False)
                 w.held = True
                 w.picked = True
+            if not w.held:
+                self._maybe_claw_push()
         elif claw == c.CLAW_OPEN and w.held:
             w.held = False
             if w.pose == "drop":
@@ -847,7 +875,8 @@ def make_sim(cfg, seed, depth_bias, r_cam_true, car=None):
     world.clock = clock
     cam = SimCam(world, clock, rng, random.Random(seed * 31 + 1))
     lift = SimLift(world, clock)
-    arm = SimArm(world, clock, cfg, rng, random.Random(seed * 31 + 2), random.Random(seed * 31 + 3))
+    arm = SimArm(world, clock, cfg, rng, random.Random(seed * 31 + 2), random.Random(seed * 31 + 3),
+                 random.Random(seed * 31 + 5))
     if _c(cfg, "SIM_CHASSIS_DYNAMICS", False) and cfg.CHASSIS_ACKERMANN:
         chassis = SimWheeltec(world, clock, random.Random(seed * 31 + 4), cfg)
     else:

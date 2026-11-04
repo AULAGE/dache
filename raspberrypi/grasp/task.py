@@ -51,6 +51,12 @@ class GraspTask:
         # ghost 指纹（任务 10）：之前判定为"机械臂自己"的读数
         self.ghost_path = os.path.join(log_dir, cfg.GHOST_FP_FILE) if log_dir else None
         self.ghosts = self._load_ghosts() if cfg.GHOST_FINGERPRINT else []
+        # 任务 13：记住发给每个舵机的最后脉宽（ARM_MOVE_SCALE 按脉宽差缩放动作时间用）；
+        # 换了机械臂设备对象 / USB 重连过就当作不知道（舵机可能被重新上电回到上电姿态）
+        self._arm_known = {}
+        self._arm_known_key = None
+        self.learn_skipped_reversal = 0   # 统计：LEARN_SAME_DIR_ONLY 跳过了几次换向步
+        self._pushed = None               # 这次观察确认发现物块被推开时的 (Δx, Δy, Δd)，否则 None
 
     # ------------------------------------------------ 工具
     def say(self, *a):
@@ -188,7 +194,33 @@ class GraspTask:
         self.base_deg = deg
         return deg
 
-    def _arm(self, pulses, ms, precise=True):
+    # ---- 任务 13：动作时间按脉宽差缩放
+    def _arm_state(self):
+        """已知的舵机脉宽；机械臂对象换了或重连过就清空"""
+        key = (id(self.arm), getattr(self.arm, "reconnects", 0))
+        if key != self._arm_known_key:
+            self._arm_known = {}
+            self._arm_known_key = key
+        return self._arm_known
+
+    def _scaled_ms(self, pulses, ms):
+        """ms = clamp(Δ最大 × ARM_MS_PER_US, ARM_MIN_MS, 原值)；有舵机位置不知道就用原值"""
+        c = self.cfg
+        known = self._arm_state()
+        if any(int(k) not in known for k in pulses):
+            return ms
+        dmax = max(abs(int(max(500, min(2500, v))) - known[int(k)]) for k, v in pulses.items())
+        return int(min(ms, max(c.ARM_MIN_MS, dmax * c.ARM_MS_PER_US)))
+
+    def _send(self, pulses, ms, scale=True):
+        """所有机械臂指令都从这里发；ARM_MOVE_SCALE 关闭时和直接 self.arm.move 完全一样"""
+        if self.cfg.ARM_MOVE_SCALE and scale:
+            ms = self._scaled_ms(pulses, ms)
+        self.arm.move(pulses, ms)
+        known = self._arm_state()
+        known.update({int(k): int(max(500, min(2500, v))) for k, v in pulses.items()})
+
+    def _arm(self, pulses, ms, precise=True, scale=True):
         """
         发机械臂指令。带底座（6 号）时记下脉宽和转动方向；打开 BASE_BACKLASH_DEG 后，
         precise 的动作如果最后一段不是从 BASE_APPROACH_DIR 那边过来的，先多转 BASE_BACKLASH_DEG 再转回来。
@@ -197,7 +229,7 @@ class GraspTask:
         c = self.cfg
         p = pulses.get(c.BASE_ID)
         if p is None:
-            self.arm.move(pulses, ms)
+            self._send(pulses, ms, scale)
             return
         p = int(round(p))
         a = c.BASE_APPROACH_DIR * c.BASE_DIR          # 逼近方向（脉宽增大 = +1）
@@ -207,13 +239,13 @@ class GraspTask:
         if precise and bl > 0 and not (move == a or (move == 0 and self._base_dir == a)):
             over = int(round(p - a * bl * c.BASE_US_PER_DEG))      # 先转过头（逼近方向的反方向）
             dist = abs(over - (prev if prev is not None else p)) / c.BASE_US_PER_DEG
-            self.arm.move({c.BASE_ID: over}, int(max(150, ms if len(pulses) == 1 else 0,
-                                                     dist * c.BASE_MS_PER_DEG)))
+            self._send({c.BASE_ID: over}, int(max(150, ms if len(pulses) == 1 else 0,
+                                                  dist * c.BASE_MS_PER_DEG)), scale)
             self.backlash_moves += 1
             move = a
             if len(pulses) == 1:              # 只动底座：大段已经走完，回来只有 BASE_BACKLASH_DEG 这么远
                 ms = int(max(150, bl * c.BASE_MS_PER_DEG))
-        self.arm.move(pulses, ms)
+        self._send(pulses, ms, scale)
         if move:
             self._base_dir = move
         self._base_sent = p
@@ -403,6 +435,7 @@ class GraspTask:
                 return False, m, step
 
             # 执行：升降轴和底盘 / 底座同时动
+            dir0 = self._base_dir                # 任务 13：这一步之前底座最后一次转动的方向
             if u_y:
                 self.lift.start_move_by(u_y)
             if recenter and self.can_turn:
@@ -469,7 +502,10 @@ class GraspTask:
                 if u_y:
                     self.axes["y"].learn(u_y, e["y"], e2["y"])
                 if u_x and not recenter and not u_d:
-                    self.axes["x_deg"].learn(u_x, e["x_deg"], e2["x_deg"], s_x)
+                    if c.LEARN_SAME_DIR_ONLY and not (dir0 and self._base_dir == dir0):
+                        self.learn_skipped_reversal += 1     # 换向（或之前方向未知）：含回差，不学
+                    else:
+                        self.axes["x_deg"].learn(u_x, e["x_deg"], e2["x_deg"], s_x)
                 if u_d and not u_x and not recenter:
                     self.axes["d"].learn(u_d, e["d"], e2["d"], s_d)
 
@@ -624,17 +660,19 @@ class GraspTask:
         elif trim:
             extra = f"（微调 {trim:+.1f}°）"
         self.say(f"抓取：深度 {m.d:.0f}mm，插值 t={max(0.0, min(1.0, t)):.2f}，底座 {self.base_deg:+.1f}°" + extra)
-        self.arm.move({c.CLAW_ID: c.CLAW_OPEN}, 300)
+        self._pushed = None
+        self._send({c.CLAW_ID: c.CLAW_OPEN}, 300)
         self._arm({**c.POSES["ready"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
-        self._arm({**reach, c.BASE_ID: bp}, c.ARM_SLOW_MS)
-        self.arm.move({c.CLAW_ID: c.CLAW_CLOSE}, 500)
+        self._arm({**reach, c.BASE_ID: bp}, c.ARM_SLOW_MS, scale=False)    # 伸向物块：保持慢速
+        self._send({c.CLAW_ID: c.CLAW_CLOSE}, 500)
 
         verify = c.VERIFY
         m_before = self.measure() if verify in ("lift_check", "auto") else None
         self.lift.move_by(c.LIFT_AFTER_GRASP_CM)
         self._lifted = True
         m_after = self.measure() if verify in ("lift_check", "auto") else None
-        self._arm({**c.POSES["carry"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
+        if not (verify == "observe" and c.VERIFY_SKIP_CARRY):     # 任务 13：observe 确认前的 carry 可以省掉
+            self._arm({**c.POSES["carry"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
 
         if verify == "none":
             return True
@@ -719,12 +757,44 @@ class GraspTask:
         m = self.measure()
         still = (m is not None and abs(m.d - g["d"]) < c.VERIFY_SAME_D_MM
                  and abs(m.x_deg - g["x_deg"]) < 6 and abs(m.y - g["y"]) < 30)
-        self.say("观察确认：" + ("原位置还能看到物块 → 没抓到" if still else "原位置没有物块了 → 抓到"))
+        if c.VERIFY_WHOLE_FRAME and not still:
+            still = self._whole_frame_check(m, ref)
+        else:
+            self.say("观察确认：" + ("原位置还能看到物块 → 没抓到" if still else "原位置没有物块了 → 抓到"))
         if not still:                       # 抓到了：重新抬起、收回，准备放置
             self.lift.move_by(c.LIFT_AFTER_GRASP_CM)
             self._lifted = True
             self._arm({**c.POSES["carry"], c.BASE_ID: bp}, c.ARM_MOVE_MS)
         return not still
+
+    def _whole_frame_check(self, m, ref):
+        """
+        任务 13（VERIFY_WHOLE_FRAME）：原位置已经没有物块时，再看整个画面。
+        画面里别处还有物块 = 被爪子推开了（再测一次，排除一闪而过的误识别）→ 没抓到，记下推开了多远。
+        返回 True = 物块还在（没抓到）
+        """
+        c = self.cfg
+        min_d = c.VERIFY_WHOLE_MIN_D_MM
+
+        def usable(x):
+            return x is not None and not (min_d > 0 and x.d < min_d)
+
+        if m is not None and not usable(m):
+            self.say(f"观察确认：画面里的物块深度只有 {m.d:.0f}mm（< {min_d:.0f}mm，可能是爪子里抓着的），不算")
+        if usable(m):
+            m2 = self.measure()
+            if usable(m2):
+                if ref is not None:
+                    dx, dy, dd = m2.x - ref.x, m2.y - ref.y, m2.d - ref.d
+                else:
+                    dx, dy, dd = m2.x, m2.y - c.GOAL["y"], m2.d - c.GOAL["d"]
+                self._pushed = (round(dx, 1), round(dy, 1), round(dd, 1))
+                self.say(f"观察确认：原位置没有物块，但画面里还有 → 物块被推开了 Δx={dx:+.0f}mm Δy={dy:+.0f}mm "
+                         f"Δd={dd:+.0f}mm（x 右为正、d 远为正）→ 没抓到")
+                return True
+            self.say("观察确认：画面里一闪而过的目标没有复现（误识别），按画面里没有物块处理")
+        self.say("观察确认：整个画面都没有物块了 → 抓到")
+        return False
 
     def _lower_back(self):
         """升降轴回到抓取前的高度（只在抬起过时）"""
@@ -737,13 +807,13 @@ class GraspTask:
         drop = c.POSES.get("drop")
         if drop:
             self._arm({c.BASE_ID: self.base_pulse(), **drop}, c.ARM_MOVE_MS, precise=False)
-            self.arm.move({c.CLAW_ID: c.CLAW_OPEN}, 400)
+            self._send({c.CLAW_ID: c.CLAW_OPEN}, 400)
         self.go_observe(0)
         self._lower_back()
 
     def release_and_back_off(self):
         c = self.cfg
-        self.arm.move({c.CLAW_ID: c.CLAW_OPEN}, 400)
+        self._send({c.CLAW_ID: c.CLAW_OPEN}, 400)
         self.go_observe()
         self._lower_back()
         if c.USE_CHASSIS:
@@ -763,6 +833,7 @@ class GraspTask:
 
         fails = 0                       # 这个物块伸出抓空了几次（任务 09：决定下一次的左右试探）
         probed = False
+        pushes = 0                      # 任务 13：这个物块被爪子推开了几次（VERIFY_WHOLE_FRAME 才会发现）
         self._probe_mm = 0.0
         grasp_d = None
         self.go_observe(0)
@@ -795,6 +866,9 @@ class GraspTask:
                 self.place()
                 break
             result = "grasp_failed"
+            if self._pushed is not None:
+                result = "pushed"
+                pushes += 1
             fails += 1
             nxt = self._probe_for(fails)
             self.say("抓取失败，松开、退后重试" + (f"（下一次落点试探 {nxt:+.0f}mm）" if nxt else ""))
@@ -802,7 +876,9 @@ class GraspTask:
             m = self.measure() or self.search()
 
         # 任务 09：按这个物块的结果学习落点微调（没打开 TRIM_LEARN 时什么都不做）
-        if grasp_d is not None and self.trim_state is not None:
+        if grasp_d is not None and self.trim_state is not None and pushes:
+            self.say(f"这个物块被推开过 {pushes} 次，落点不可信，不用它学习落点微调")
+        elif grasp_d is not None and self.trim_state is not None:
             ok = result == "success"
             self._learn_trim(grasp_d, self._probe_mm if ok else 0.0, getattr(self, "_probe_deg", 0.0), ok)
         if probed:
@@ -825,6 +901,8 @@ class GraspTask:
             row["probe_used"] = int(probed)
             row["grasp_d"] = None if grasp_d is None else round(grasp_d, 1)
             row["trim_learned"] = None if grasp_d is None else round(self.learned_trim(grasp_d), 3)
+        if c.VERIFY_WHOLE_FRAME:                                     # 任务 13 打开时才多记一列
+            row["pushes"] = pushes
         self._append_csv("episodes.csv", row)
         self.say(f"结果：{result}  步数 {steps}  用时 {dt:.1f}s  评分 {score:.1f}")
         return row
