@@ -602,6 +602,23 @@ def test_geometry():
         check("无底盘：超出远端时按远端目标", abs(g["y"] - 43.0) < 1e-9)
         cfg.USE_CHASSIS = True
         check("有底盘：用固定 GOAL", t.goal_for(devices.Measurement(0, 0, 185.5, 5)) is cfg.GOAL)
+        # DEPTH_FROM_ROW（2026-11-04 真机：K230 深度跳 ~50mm，y/d 不跳）
+        cfg.USE_CHASSIS = False
+        cfg.GOAL.update({"x_deg": -8.44, "y": 67.0, "d": 155.0})
+        cfg.GOAL_FAR = {"x_deg": -6.85, "y": 38.5, "d": 241.5}
+        rmid = (67.0 / 155.0 + 38.5 / 241.5) / 2            # 正好在近/远中间的像素行 → 深度 198.25
+        jumped = devices.Measurement(-0.1 * 250, rmid * 250, 250, 5, rmid, -0.1)   # K230 深度跳到 250
+        check("DEPTH_FROM_ROW 默认关：原样返回", t.row_depth(jumped) is jumped)
+        cfg.DEPTH_FROM_ROW = True
+        m2 = t.row_depth(jumped)
+        check("DEPTH_FROM_ROW：按像素行插值出深度，Y/X 按新深度重算、方位角不变",
+              abs(m2.d - 198.25) < 0.01 and abs(m2.y - rmid * 198.25) < 0.01
+              and abs(m2.x_deg - jumped.x_deg) < 1e-9, f"{m2}")
+        far_off = devices.Measurement(0, 0.6 * 400, 400, 5)     # 和标定平面差太多（推算值离 K230 深度太远）
+        check("DEPTH_FROM_ROW：推算值和 K230 差太多时用回 K230 深度", t.row_depth(far_off) is far_off)
+        cfg.USE_CHASSIS = True
+        check("DEPTH_FROM_ROW：有底盘时不生效", t.row_depth(jumped) is jumped)
+        cfg.DEPTH_FROM_ROW = False
     finally:
         cfg.USE_CHASSIS, cfg.GOAL_FAR = saved[0], saved[1]
         cfg.GOAL.clear()

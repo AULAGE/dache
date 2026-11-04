@@ -15,7 +15,7 @@ import math
 import os
 import time
 
-from devices import DeviceError, ManualOverride, lerp_pose
+from devices import DeviceError, ManualOverride, Measurement, lerp_pose
 from servo import NOISE, build_axes, save_axes
 
 
@@ -75,7 +75,23 @@ class GraspTask:
             raise DeviceError("K230 没有任何数据（连心跳都没有）：检查 K230 串口线和程序")
         if m is not None and self.ghost_match(m):
             return None
-        return m
+        return self.row_depth(m)
+
+    def row_depth(self, m):
+        """DEPTH_FROM_ROW：按像素行（y/d）在近/远两个标定点之间插值出深度，代替会跳的 K230 深度"""
+        c = self.cfg
+        g, gf = c.GOAL, getattr(c, "GOAL_FAR", None)
+        if m is None or not c.DEPTH_FROM_ROW or c.USE_CHASSIS or not gf:
+            return m
+        rn, rf = g["y"] / g["d"], gf["y"] / gf["d"]
+        if abs(rn - rf) < 0.02:
+            return m
+        r = m.ry if m.ry is not None else m.y / max(m.d, 1.0)
+        rx = m.rx if m.rx is not None else m.x / max(m.d, 1.0)
+        d_row = g["d"] + (rn - r) / (rn - rf) * (gf["d"] - g["d"])
+        if d_row < 50 or abs(d_row - m.d) > c.DEPTH_ROW_MAX_JUMP_MM:
+            return m
+        return Measurement(rx * d_row, r * d_row, d_row, m.n, r, rx)
 
     # ------------------------------------------------ ghost 指纹（任务 10）
     def _load_ghosts(self):

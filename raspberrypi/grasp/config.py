@@ -290,6 +290,13 @@ VERIFY_SAME_D_MM = 40.0   # 观察确认：深度和 GOAL 相差小于这个值�
 # 不在原位置 = 物块被爪子推开了：打印推开了多远，这次结果记成 "pushed"，任务 09 的落点学习跳过这个物块。
 # False = 原行为（只看原位置附近 ±6°、±30mm、±40mm，物块被推开 2~3cm 时会误判成"抓到"）
 VERIFY_WHOLE_FRAME = False
+# 用"物块在画面里的高低位置"推算深度（2026-11-04 真机：K230 深度在两个值之间跳，相差约 50mm，
+# 静止时同一物块 181/240、203/252 来回跳；而 y/d（像素行）几乎不抖，噪声约为深度的 1/10）。
+# 原理：物块和近/远两个标定点在同一平面（相对相机同一高度）时，像素行和深度一一对应 → 按 GOAL、GOAL_FAR 的 y/d 插值出深度，
+# X、Y 也按新深度重算（方位角不变）。只在无底盘、标了 GOAL_FAR 时生效；推算值和 K230 深度相差超过
+# DEPTH_ROW_MAX_JUMP_MM（物块高度和标定时差太多，例如升降轴还没对准）就用回 K230 深度。False = 原行为
+DEPTH_FROM_ROW = False
+DEPTH_ROW_MAX_JUMP_MM = 80.0
 # 整画面确认时，比这个深度还近的读数不算（可能是爪子里抓着的那个物块）。0 = 不排除。
 # 真机上先在 IDE 里看"抓着物块回到观察姿态时画面里能不能看到它、深度多少"，看得到就设成比它大一点
 VERIFY_WHOLE_MIN_D_MM = 0.0
@@ -342,7 +349,7 @@ CALIB_KEYS = {          # 允许被 calib.json 覆盖的参数
     "GHOST_FINGERPRINT", "GHOST_FP_TOL", "GHOST_FP_MIN_HITS", "GHOST_FP_MAX",
     "K230_SYNC_PORT", "K230_SYNC_PERIOD_S",
     "DASHBOARD_PORT", "DEMO_AUTO_INTERVAL_S", "DEMO_TTS_CMD",
-    "VERIFY_WHOLE_FRAME", "VERIFY_WHOLE_MIN_D_MM", "VERIFY_SKIP_CARRY", "ARM_MOVE_SCALE", "ARM_MS_PER_US",
+    "VERIFY_WHOLE_FRAME", "DEPTH_FROM_ROW", "DEPTH_ROW_MAX_JUMP_MM", "VERIFY_WHOLE_MIN_D_MM", "VERIFY_SKIP_CARRY", "ARM_MOVE_SCALE", "ARM_MS_PER_US",
     "ARM_MIN_MS", "LEARN_SAME_DIR_ONLY",
 }
 

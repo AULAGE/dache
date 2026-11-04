@@ -44,6 +44,9 @@ class Measurement:
     y: float          # mm，下为正
     d: float          # mm，深度
     n: int            # 用了几帧
+    # 各帧 y/d、x/d 的中位数 = 物块在画面里的像素位置（和 K230 深度无关）；仿真 / 手工构造时为 None
+    ry: float = None
+    rx: float = None
 
     @property
     def x_deg(self):
@@ -63,7 +66,9 @@ def _median_measure(frames, n):
     return Measurement(statistics.median(f[1] for f in frames),
                        statistics.median(f[2] for f in frames),
                        statistics.median(f[3] for f in frames),
-                       len(frames))
+                       len(frames),
+                       statistics.median(f[2] / max(f[3], 1.0) for f in frames),
+                       statistics.median(f[1] / max(f[3], 1.0) for f in frames))
 
 
 # ============================================================ K230
